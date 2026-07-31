@@ -32,6 +32,7 @@ from .prompting import prompt_for_task
 from .reporting import (
     concatenate_tables,
     display_scores,
+    write_document_review_package,
     write_results_workbook,
 )
 from .retrieval import PremiseRetriever, ensure_rag_repository
@@ -161,6 +162,7 @@ def run_llm_evaluation(
                 document_errors.append(document_tables.errors)
 
         scores = concatenate_tables([tables.scores for tables in validation_tables])
+        combined_document_pairs = concatenate_tables(document_pairs)
         workbook = write_results_workbook(
             f"ready_llm_{slugify_model_id(spec.model_id)}",
             {
@@ -175,7 +177,7 @@ def run_llm_evaluation(
                     [tables.predictions for tables in validation_tables]
                 ),
                 "document_aggregates": concatenate_tables(document_aggregates),
-                "document_pairs": concatenate_tables(document_pairs),
+                "document_pairs": combined_document_pairs,
                 "errors": concatenate_tables(document_errors),
             },
             {
@@ -195,8 +197,15 @@ def run_llm_evaluation(
             },
             output_dir=results_dir,
         )
+        review_package = write_document_review_package(
+            f"ready_llm_{slugify_model_id(spec.model_id)}",
+            combined_document_pairs,
+            output_dir=results_dir,
+        )
         display_scores(scores)
         download_file(workbook)
+        if review_package is not None:
+            download_file(review_package)
         return scores
     finally:
         del predictors

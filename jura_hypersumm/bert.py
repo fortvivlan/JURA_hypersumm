@@ -23,7 +23,11 @@ from .common import (
     set_random_seed,
 )
 from .inference import ModelPrediction, run_document_inference
-from .reporting import display_scores, write_results_workbook
+from .reporting import (
+    display_scores,
+    write_document_review_package,
+    write_results_workbook,
+)
 from .retrieval import PremiseRetriever, ensure_rag_repository
 
 DEFAULT_BERT_MODEL = "ai-forever/sbert_large_nlu_ru"
@@ -366,8 +370,15 @@ def _run_bert(
             },
             output_dir=results_dir,
         )
+        review_package = write_document_review_package(
+            f"bert_{task}",
+            document_tables.pairs,
+            output_dir=results_dir,
+        )
         display_scores(evaluation.scores)
         download_file(workbook)
+        if review_package is not None:
+            download_file(review_package)
         return evaluation.scores
     finally:
         if model is not None:

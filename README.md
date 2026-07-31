@@ -186,6 +186,23 @@ metrics, a confusion matrix, raw validation predictions, document-level
 aggregates, every retrieved premise/pair prediction, errors, and reproducibility
 metadata. Results are written under `/content/jura_results`, not Drive.
 
+When at least one document is successfully analysed, the workflow also
+downloads a ZIP prepared for human review. For every document it contains:
+
+- `<document>_<task>_model_predictions.xlsx`, with every RAG premise/model pair
+  and the columns `hypothesis`, `premise`, `model_prediction`, `expert_label`,
+  and `expert_comment`. A specialist can fill the last two columns so these
+  predictions can later be scored against human labels.
+- `<document>_rag_retrieval.xlsx`, with exactly `sentence`, `article_number`,
+  and `article_text`. It contains the top-ranked article used for each
+  processed sentence and is intended for separate manual RAG evaluation.
+
+LoRA and BERT runs produce one model-prediction workbook per document. A ready
+LLM run produces binary and ternary model-prediction workbooks for each
+document, while sharing one deduplicated RAG workbook. The detailed main
+workbook still retains all retrieval candidates and ranks; only the compact
+RAG review workbook is limited to the top-ranked article per sentence.
+
 Document inference extracts the final `ПОСТАНОВИЛ` section, splits it with
 `razdel`, performs deterministic citation lookup before a maximum of 20 FAISS
 matches, and preserves the premise responsible for every contradiction. A

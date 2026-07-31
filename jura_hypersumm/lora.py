@@ -33,7 +33,11 @@ from .common import (
 from .inference import run_document_inference
 from .llm_common import CausalPredictor, load_causal_model
 from .prompting import build_training_texts, prompt_for_task
-from .reporting import display_scores, write_results_workbook
+from .reporting import (
+    display_scores,
+    write_document_review_package,
+    write_results_workbook,
+)
 from .retrieval import PremiseRetriever, ensure_rag_repository
 
 DEFAULT_LORA_HYPERPARAMETERS: dict[str, Any] = {
@@ -370,8 +374,15 @@ def run(
             },
             output_dir=results_dir,
         )
+        review_package = write_document_review_package(
+            f"lora_{slugify_model_id(spec.model_id)}_{validated_task}",
+            document_tables.pairs,
+            output_dir=results_dir,
+        )
         display_scores(evaluation.scores)
         download_file(workbook)
+        if review_package is not None:
+            download_file(review_package)
         return evaluation.scores
     finally:
         if model is not None:
