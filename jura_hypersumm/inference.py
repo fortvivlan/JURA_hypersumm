@@ -1,0 +1,165 @@
+"""Shared full-document RAG inference and aggregation."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol, Sequence
+
+from .common import LABELS_BY_TASK, Task
+from .documents import extract_operative_section, read_docx_text, split_russian_sentences
+from .retrieval import PremiseRetriever, citation_dict
+
+
+@dataclass(frozen=True)
+class ModelPrediction:
+    """A parsed prediction and the corresponding raw model output."""
+
+    label: str | None
+    raw_output: str = ""
+
+
+class PairPredictor(Protocol):
+    """Minimal predictor interface required by document inference."""
+
+    def predict_pairs(
+        self, premises: Sequence[str], hypothesis: str
+    ) -> list[ModelPrediction]: ...
+
+
+def aggregate_pair_labels(labels: Sequence[str | None], task: Task) -> str:
+    """Aggregate premise-pair labels with contradiction-first semantics."""
+    valid = [label for label in labels if label in LABELS_BY_TASK[task]]
+    if "contradiction" in valid:
+        return "contradiction"
+    if task == "binary":
+        return "no" if "no" in valid else "invalid"
+    if "entailment" in valid:
+        return "entailment"
+    if "not mentioned" in valid:
+        return "not mentioned"
+    return "invalid"
+
+
+@dataclass
+class DocumentInferenceTables:
+    """Aggregate, pair-level, and error tables for uploaded decisions."""
+
+    aggregates: object
+    pairs: object
+    errors: object
+
+
+def run_document_inference(
+    document_paths: Sequence[Path],
+    *,
+    predictor: PairPredictor,
+    retriever: PremiseRetriever,
+    model_id: str,
+    task: Task,
+    top_k: int = 20,
+) -> DocumentInferenceTables:
+    """Run operative-section sentence retrieval and classification for DOCX files."""
+    import pandas as pd
+    from tqdm.auto import tqdm
+
+    aggregate_rows: list[dict[str, object]] = []
+    pair_rows: list[dict[str, object]] = []
+    error_rows: list[dict[str, object]] = []
+    for document_path in document_paths:
+        try:
+            full_text = read_docx_text(document_path)
+            operative = extract_operative_section(full_text)
+            if operative is None:
+                error_rows.append(
+                    {
+                        "model": model_id,
+                        "task": task,
+                        "document": document_path.name,
+                        "stage": "operative_section",
+                        "error": "ПОСТАНОВИЛ section was not found; document skipped",
+                    }
+                )
+                continue
+            hypotheses = split_russian_sentences(operative)
+            for sentence_index, hypothesis in enumerate(
+                tqdm(
+                    hypotheses,
+                    desc=f"{document_path.name} [{task}]",
+                    leave=False,
+                )
+            ):
+                hypothesis_id = f"{document_path.name}:{sentence_index:05d}"
+                retrieved = retriever.retrieve(hypothesis, top_k=top_k)
+                if not retrieved:
+                    error_rows.append(
+                        {
+                            "model": model_id,
+                            "task": task,
+                            "document": document_path.name,
+                            "hypothesis_id": hypothesis_id,
+                            "stage": "retrieval",
+                            "error": "No premises were retrieved",
+                        }
+                    )
+                    continue
+                predictions = predictor.predict_pairs(
+                    [record.premise for record in retrieved], hypothesis
+                )
+                if len(predictions) != len(retrieved):
+                    raise RuntimeError("Predictor returned the wrong number of results")
+                contradiction_sources: list[str] = []
+                for record, prediction in zip(retrieved, predictions):
+                    if prediction.label == "contradiction":
+                        contradiction_sources.append(record.source)
+                    pair_rows.append(
+                        {
+                            "model": model_id,
+                            "task": task,
+                            "document": document_path.name,
+                            "hypothesis_id": hypothesis_id,
+                            "sentence_index": sentence_index,
+                            "hypothesis": hypothesis,
+                            "premise": record.premise,
+                            "source": record.source,
+                            "retrieval_method": record.method,
+                            "retrieval_rank": record.rank,
+                            "retrieval_score": record.score,
+                            **citation_dict(record.citation),
+                            "prediction": prediction.label or "invalid",
+                            "raw_output": prediction.raw_output,
+                        }
+                    )
+                aggregate_rows.append(
+                    {
+                        "model": model_id,
+                        "task": task,
+                        "document": document_path.name,
+                        "hypothesis_id": hypothesis_id,
+                        "sentence_index": sentence_index,
+                        "hypothesis": hypothesis,
+                        "prediction": aggregate_pair_labels(
+                            [prediction.label for prediction in predictions], task
+                        ),
+                        "retrieved_premises": len(retrieved),
+                        "contradiction_sources": json.dumps(
+                            contradiction_sources, ensure_ascii=False
+                        ),
+                    }
+                )
+        except Exception as error:  # keep other uploaded files processable
+            error_rows.append(
+                {
+                    "model": model_id,
+                    "task": task,
+                    "document": document_path.name,
+                    "stage": "document_processing",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+    return DocumentInferenceTables(
+        aggregates=pd.DataFrame(aggregate_rows),
+        pairs=pd.DataFrame(pair_rows),
+        errors=pd.DataFrame(error_rows),
+    )

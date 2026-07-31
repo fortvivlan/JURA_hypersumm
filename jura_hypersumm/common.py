@@ -1,0 +1,260 @@
+"""Shared labels, model registry, dataset loading, seeding, and evaluation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
+
+Task = Literal["binary", "ternary"]
+
+TERNARY_LABELS = ("contradiction", "entailment", "not mentioned")
+BINARY_LABELS = ("contradiction", "no")
+LABELS_BY_TASK: dict[Task, tuple[str, ...]] = {
+    "binary": BINARY_LABELS,
+    "ternary": TERNARY_LABELS,
+}
+LABEL2ID_BY_TASK: dict[Task, dict[str, int]] = {
+    task: {label: index for index, label in enumerate(labels)}
+    for task, labels in LABELS_BY_TASK.items()
+}
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_RAG_REPOSITORY = "https://github.com/fortvivlan/dms-rag"
+DEFAULT_RAG_DIR = Path("/content/dms-rag")
+DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/jura")
+DEFAULT_RESULTS_DIR = Path("/content/jura_results")
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """Configuration for one supported causal language model."""
+
+    alias: str
+    model_id: str
+    trust_remote_code: bool = False
+
+
+MODEL_SPECS = (
+    ModelSpec("llama", "meta-llama/Llama-3.1-8B"),
+    ModelSpec("ministral", "mistralai/Ministral-8B-Instruct-2410"),
+    ModelSpec("qwen", "Qwen/Qwen3-8B"),
+    ModelSpec("t-lite", "t-tech/T-lite-it-2.1"),
+)
+_MODEL_BY_NAME = {
+    name: spec
+    for spec in MODEL_SPECS
+    for name in (spec.alias.lower(), spec.model_id.lower())
+}
+
+
+def validate_task(task: str) -> Task:
+    """Return a validated task name."""
+    normalized = task.strip().lower()
+    if normalized not in LABELS_BY_TASK:
+        raise ValueError("task must be either 'binary' or 'ternary'")
+    return normalized  # type: ignore[return-value]
+
+
+def resolve_model(model_name: str) -> ModelSpec:
+    """Resolve a supported model alias or full Hugging Face model ID."""
+    try:
+        return _MODEL_BY_NAME[model_name.strip().lower()]
+    except KeyError as error:
+        supported = ", ".join(spec.alias for spec in MODEL_SPECS)
+        raise ValueError(
+            f"Unsupported model {model_name!r}; choose one of: {supported}"
+        ) from error
+
+
+def slugify_model_id(model_id: str) -> str:
+    """Convert a model ID to a filesystem-safe stable slug."""
+    return model_id.replace("/", "_").replace(" ", "_")
+
+
+def default_dataset_path(split: str, task: Task) -> Path:
+    """Return the repository-local CSV path for a split and task."""
+    return REPOSITORY_ROOT / f"{split}_{task}.csv"
+
+
+def load_dataset(path: str | Path, task: Task):
+    """Load and validate a project CSV without changing row order."""
+    import pandas as pd
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset does not exist: {path}")
+    dataframe = pd.read_csv(path)
+    required = ("premise", "hypothesis", "source", "tag")
+    missing = [column for column in required if column not in dataframe.columns]
+    if missing:
+        raise ValueError(f"{path} is missing columns: {', '.join(missing)}")
+    dataframe = dataframe.loc[:, required].copy()
+    if dataframe[list(required)].isna().any().any():
+        raise ValueError(f"{path} contains missing required values")
+    valid_labels = LABELS_BY_TASK[task]
+    invalid = sorted(set(dataframe["tag"]) - set(valid_labels))
+    if invalid:
+        raise ValueError(f"{path} contains invalid {task} labels: {invalid}")
+    dataframe.insert(
+        0,
+        "example_id",
+        [f"{path.stem}:{index:06d}" for index in range(len(dataframe))],
+    )
+    return dataframe
+
+
+def merge_parameters(
+    defaults: Mapping[str, Any], overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay validated parameter overrides on defaults."""
+    result = dict(defaults)
+    if overrides is None:
+        return result
+    unknown = sorted(set(overrides) - set(defaults))
+    if unknown:
+        raise ValueError(f"Unknown hyperparameter(s): {', '.join(unknown)}")
+    result.update(overrides)
+    return result
+
+
+def set_random_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch when installed."""
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ModuleNotFoundError:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ModuleNotFoundError:
+        pass
+
+
+def file_sha256(path: str | Path) -> str:
+    """Return a SHA-256 checksum for run metadata."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def prompt_sha256(prompt_text: str) -> str:
+    """Return a stable prompt version identifier."""
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class EvaluationTables:
+    """Normalized validation outputs used by all experiment workflows."""
+
+    scores: Any
+    per_class: Any
+    confusion_matrix: Any
+    predictions: Any
+
+
+def evaluate_predictions(
+    dataframe,
+    predictions: Sequence[str | None],
+    raw_outputs: Sequence[str],
+    *,
+    model_id: str,
+    task: Task,
+) -> EvaluationTables:
+    """Build score, per-class, confusion, and prediction tables."""
+    import pandas as pd
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        precision_recall_fscore_support,
+    )
+
+    if len(dataframe) != len(predictions) or len(predictions) != len(raw_outputs):
+        raise ValueError("Validation rows, predictions, and raw outputs must align")
+    labels = LABELS_BY_TASK[task]
+    gold = dataframe["tag"].tolist()
+    normalized = [prediction if prediction in labels else "invalid" for prediction in predictions]
+    macro = precision_recall_fscore_support(
+        gold, normalized, labels=list(labels), average="macro", zero_division=0
+    )
+    weighted = precision_recall_fscore_support(
+        gold, normalized, labels=list(labels), average="weighted", zero_division=0
+    )
+    per_values = precision_recall_fscore_support(
+        gold, normalized, labels=list(labels), average=None, zero_division=0
+    )
+    contradiction_index = labels.index("contradiction")
+    summary = pd.DataFrame(
+        [
+            {
+                "model": model_id,
+                "task": task,
+                "support": len(gold),
+                "accuracy": accuracy_score(gold, normalized),
+                "macro_precision": macro[0],
+                "macro_recall": macro[1],
+                "macro_f1": macro[2],
+                "weighted_f1": weighted[2],
+                "contradiction_precision": per_values[0][contradiction_index],
+                "contradiction_recall": per_values[1][contradiction_index],
+                "contradiction_f1": per_values[2][contradiction_index],
+                "invalid_predictions": normalized.count("invalid"),
+            }
+        ]
+    )
+    per_class = pd.DataFrame(
+        [
+            {
+                "model": model_id,
+                "task": task,
+                "label": label,
+                "precision": per_values[0][index],
+                "recall": per_values[1][index],
+                "f1": per_values[2][index],
+                "support": int(per_values[3][index]),
+            }
+            for index, label in enumerate(labels)
+        ]
+    )
+    matrix_labels = list(labels) + (["invalid"] if "invalid" in normalized else [])
+    matrix = confusion_matrix(gold, normalized, labels=matrix_labels)
+    confusion = pd.DataFrame(
+        [
+            {
+                "model": model_id,
+                "task": task,
+                "gold_label": gold_label,
+                "predicted_label": predicted_label,
+                "count": int(matrix[row, column]),
+            }
+            for row, gold_label in enumerate(matrix_labels)
+            for column, predicted_label in enumerate(matrix_labels)
+        ]
+    )
+    result_rows = dataframe.copy()
+    result_rows["prediction"] = normalized
+    result_rows["raw_output"] = list(raw_outputs)
+    result_rows["correct"] = result_rows["tag"] == result_rows["prediction"]
+    result_rows.insert(1, "model", model_id)
+    result_rows.insert(2, "task", task)
+    return EvaluationTables(summary, per_class, confusion, result_rows)
+
+
+def json_value(value: Any) -> str:
+    """Serialize a metadata value consistently."""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return str(value)
