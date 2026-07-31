@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import random
+import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -28,6 +33,9 @@ DEFAULT_RAG_REPOSITORY = "https://github.com/fortvivlan/dms-rag"
 DEFAULT_RAG_DIR = Path("/content/dms-rag")
 DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/jura")
 DEFAULT_RESULTS_DIR = Path("/content/jura_results")
+DEFAULT_BERT_REVISION = "89deeaa197d9d146e5763ac1f5fe32bf66817126"
+DEFAULT_EMBEDDING_REVISION = DEFAULT_BERT_REVISION
+DEFAULT_RAG_REVISION = "278ec2c11fe68b003aef8a8527e0bb7eeaaeed66"
 
 
 @dataclass(frozen=True)
@@ -36,14 +44,29 @@ class ModelSpec:
 
     alias: str
     model_id: str
+    revision: str | None
     trust_remote_code: bool = False
 
 
 MODEL_SPECS = (
-    ModelSpec("llama", "meta-llama/Llama-3.1-8B"),
-    ModelSpec("ministral", "mistralai/Ministral-8B-Instruct-2410"),
-    ModelSpec("qwen", "Qwen/Qwen3-8B"),
-    ModelSpec("t-lite", "t-tech/T-lite-it-2.1"),
+    # Llama is gated, so its immutable commit is resolved with the user's HF
+    # token at run start and then stored in the run manifest.
+    ModelSpec("llama", "meta-llama/Llama-3.1-8B", None),
+    ModelSpec(
+        "ministral",
+        "mistralai/Ministral-8B-Instruct-2410",
+        "2f494a194c5b980dfb9772cb92d26cbb671fce5a",
+    ),
+    ModelSpec(
+        "qwen",
+        "Qwen/Qwen3-8B",
+        "b968826d9c46dd6066d109eabc6255188de91218",
+    ),
+    ModelSpec(
+        "t-lite",
+        "t-tech/T-lite-it-2.1",
+        "d125c970c553de58fcee3c937d5e4867d4a448d8",
+    ),
 )
 _MODEL_BY_NAME = {
     name: spec
@@ -129,10 +152,20 @@ def merge_parameters(
     return result
 
 
-def set_random_seed(seed: int) -> None:
-    """Seed Python, NumPy, and PyTorch when installed."""
-    random.seed(seed)
+def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
+    """Seed all RNGs and enforce deterministic PyTorch/CUDA execution.
+
+    Strict deterministic mode raises if PyTorch encounters an operation for
+    which it cannot provide a deterministic implementation. This is preferable
+    to silently completing a run that cannot be reproduced.
+    """
     os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    previous_cublas_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if deterministic:
+        # Must be set before the first cuBLAS workspace is initialized.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    random.seed(seed)
     try:
         import numpy as np
 
@@ -142,11 +175,158 @@ def set_random_seed(seed: int) -> None:
     try:
         import torch
 
+        cuda_was_initialized = torch.cuda.is_initialized()
+        if (
+            deterministic
+            and cuda_was_initialized
+            and previous_cublas_config not in {":16:8", ":4096:8"}
+        ):
+            raise RuntimeError(
+                "Strict deterministic mode was requested after CUDA was already "
+                "initialized without a deterministic CUBLAS_WORKSPACE_CONFIG. "
+                "Restart the runtime and call the workflow before using CUDA."
+            )
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(deterministic, warn_only=False)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = deterministic
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
     except ModuleNotFoundError:
         pass
+
+
+def set_random_seed(seed: int) -> None:
+    """Backward-compatible alias for strict deterministic configuration."""
+    configure_reproducibility(seed, deterministic=True)
+
+
+def seed_data_loader_worker(worker_id: int) -> None:
+    """Deterministically seed Python and NumPy inside a PyTorch data worker."""
+    del worker_id
+    import numpy as np
+    import torch
+
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def resolve_huggingface_revision(
+    model_id: str,
+    revision: str | None,
+    *,
+    token: str | None = None,
+) -> str:
+    """Resolve a model tag/branch to an immutable 40-character commit hash."""
+    requested = revision or "main"
+    if re.fullmatch(r"[0-9a-f]{40}", requested):
+        return requested
+    from huggingface_hub import model_info
+
+    info = model_info(model_id, revision=requested, token=token)
+    if not info.sha or not re.fullmatch(r"[0-9a-f]{40}", info.sha):
+        raise RuntimeError(
+            f"Could not resolve an immutable Hugging Face revision for {model_id}"
+        )
+    return info.sha
+
+
+def source_tree_sha256() -> str:
+    """Fingerprint executable project sources and the dependency lockfile."""
+    paths = sorted((REPOSITORY_ROOT / "jura_hypersumm").glob("*.py"))
+    paths.extend(
+        path
+        for path in (
+            REPOSITORY_ROOT / "prompt.py",
+            REPOSITORY_ROOT / "prompt_binary.py",
+            REPOSITORY_ROOT / "pyproject.toml",
+            REPOSITORY_ROOT / "uv.lock",
+        )
+        if path.is_file()
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(REPOSITORY_ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def reproducibility_metadata(seed: int, *, deterministic: bool) -> dict[str, Any]:
+    """Capture code, package, Python, OS, and accelerator run identity."""
+    distributions = (
+        "accelerate",
+        "bitsandbytes",
+        "faiss-cpu",
+        "langchain-community",
+        "langchain-huggingface",
+        "numpy",
+        "pandas",
+        "peft",
+        "scikit-learn",
+        "sentence-transformers",
+        "torch",
+        "transformers",
+    )
+    versions: dict[str, str] = {}
+    for distribution in distributions:
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(REPOSITORY_ROOT), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        commit, dirty = "unavailable", True
+    accelerator: dict[str, Any] = {}
+    try:
+        import torch
+
+        accelerator = {
+            "torch_cuda_version": torch.version.cuda,
+            "cudnn_version": torch.backends.cudnn.version(),
+            "cuda_available": torch.cuda.is_available(),
+            "gpu_names": [
+                torch.cuda.get_device_name(index)
+                for index in range(torch.cuda.device_count())
+            ],
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        }
+    except ModuleNotFoundError:
+        accelerator = {"cuda_available": False}
+    return {
+        "seed": seed,
+        "strict_determinism": deterministic,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "package_versions": versions,
+        "repository_commit": commit,
+        "repository_dirty": dirty,
+        "source_tree_sha256": source_tree_sha256(),
+        "accelerator": accelerator,
+    }
 
 
 def file_sha256(path: str | Path) -> str:

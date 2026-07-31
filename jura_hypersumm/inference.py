@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Sequence
 
-from .common import LABELS_BY_TASK, Task
+from .common import LABELS_BY_TASK, Task, file_sha256
 from .documents import extract_operative_section, read_docx_text, split_russian_sentences
 from .retrieval import PremiseRetriever, citation_dict
 
@@ -68,7 +68,9 @@ def run_document_inference(
     pair_rows: list[dict[str, object]] = []
     error_rows: list[dict[str, object]] = []
     for document_path in document_paths:
+        document_hash = "unavailable"
         try:
+            document_hash = file_sha256(document_path)
             full_text = read_docx_text(document_path)
             operative = extract_operative_section(full_text)
             if operative is None:
@@ -77,6 +79,7 @@ def run_document_inference(
                         "model": model_id,
                         "task": task,
                         "document": document_path.name,
+                        "document_sha256": document_hash,
                         "stage": "operative_section",
                         "error": "ПОСТАНОВИЛ section was not found; document skipped",
                     }
@@ -98,6 +101,7 @@ def run_document_inference(
                             "model": model_id,
                             "task": task,
                             "document": document_path.name,
+                            "document_sha256": document_hash,
                             "hypothesis_id": hypothesis_id,
                             "stage": "retrieval",
                             "error": "No premises were retrieved",
@@ -118,6 +122,7 @@ def run_document_inference(
                             "model": model_id,
                             "task": task,
                             "document": document_path.name,
+                            "document_sha256": document_hash,
                             "hypothesis_id": hypothesis_id,
                             "sentence_index": sentence_index,
                             "hypothesis": hypothesis,
@@ -136,6 +141,7 @@ def run_document_inference(
                         "model": model_id,
                         "task": task,
                         "document": document_path.name,
+                        "document_sha256": document_hash,
                         "hypothesis_id": hypothesis_id,
                         "sentence_index": sentence_index,
                         "hypothesis": hypothesis,
@@ -154,6 +160,7 @@ def run_document_inference(
                     "model": model_id,
                     "task": task,
                     "document": document_path.name,
+                    "document_sha256": document_hash,
                     "stage": "document_processing",
                     "error": f"{type(error).__name__}: {error}",
                 }

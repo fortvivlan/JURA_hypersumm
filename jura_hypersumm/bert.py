@@ -8,19 +8,31 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .colab_support import download_file, mount_drive, require_colab, uploaded_docx_files
+from .colab_support import (
+    download_file,
+    get_huggingface_token,
+    mount_drive,
+    require_colab,
+    uploaded_docx_files,
+)
 from .common import (
+    DEFAULT_BERT_REVISION,
     DEFAULT_DRIVE_ROOT,
+    DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
+    DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
     LABEL2ID_BY_TASK,
     Task,
+    configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
     file_sha256,
     load_dataset,
     merge_parameters,
-    set_random_seed,
+    reproducibility_metadata,
+    resolve_huggingface_revision,
+    seed_data_loader_worker,
 )
 from .inference import ModelPrediction, run_document_inference
 from .reporting import (
@@ -47,7 +59,9 @@ DEFAULT_BERT_PARAMETERS: dict[str, Any] = {
     "gradient_checkpointing": False,
     "retrieval_top_k": 20,
     "embedding_device": "cpu",
+    "embedding_revision": DEFAULT_EMBEDDING_REVISION,
     "seed": 42,
+    "deterministic": True,
 }
 
 
@@ -98,6 +112,7 @@ def _train_bert(
     task: Task,
     model_id: str,
     revision: str,
+    token: str | None,
     parameters: Mapping[str, Any],
 ):
     import torch
@@ -118,10 +133,13 @@ def _train_bert(
         raise RuntimeError("A CUDA device was requested but is not available")
     label2id = LABEL2ID_BY_TASK[task]
     id2label = {index: label for label, index in label2id.items()}
-    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, revision=revision, token=token
+    )
     model = AutoModelForSequenceClassification.from_pretrained(
         model_id,
         revision=revision,
+        token=token,
         num_labels=len(label2id),
         label2id=label2id,
         id2label=id2label,
@@ -162,6 +180,7 @@ def _train_bert(
         num_workers=int(parameters["num_workers"]),
         pin_memory=device.type == "cuda",
         generator=generator,
+        worker_init_fn=seed_data_loader_worker,
     )
     val_loader = DataLoader(
         PairDataset(val_dataframe),
@@ -170,6 +189,7 @@ def _train_bert(
         collate_fn=collate,
         num_workers=int(parameters["num_workers"]),
         pin_memory=device.type == "cuda",
+        worker_init_fn=seed_data_loader_worker,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -267,20 +287,39 @@ def _run_bert(
     train_path: str | Path | None,
     val_path: str | Path | None,
     rag_dir: str | Path,
+    rag_revision: str,
     drive_root: str | Path,
     model_id: str,
-    revision: str,
+    revision: str | None,
     hyperparameters: Mapping[str, Any] | None,
     results_dir: str | Path,
 ):
     require_colab()
     parameters = merge_parameters(DEFAULT_BERT_PARAMETERS, hyperparameters)
-    set_random_seed(int(parameters["seed"]))
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     train_path = Path(train_path or default_dataset_path("train", task))
     val_path = Path(val_path or default_dataset_path("val", task))
+    train_hash = file_sha256(train_path)
+    val_hash = file_sha256(val_path)
+    reproducibility = reproducibility_metadata(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     train_dataframe = load_dataset(train_path, task)
     val_dataframe = load_dataset(val_path, task)
-    rag_path, rag_commit = ensure_rag_repository(rag_dir)
+    token = get_huggingface_token()
+    requested_revision = revision or (
+        DEFAULT_BERT_REVISION if model_id == DEFAULT_BERT_MODEL else None
+    )
+    effective_revision = resolve_huggingface_revision(
+        model_id, requested_revision, token=token
+    )
+    rag_path, rag_commit = ensure_rag_repository(
+        rag_dir, revision=rag_revision
+    )
     model = tokenizer = None
     try:
         model, tokenizer, history, compute_dtype = _train_bert(
@@ -288,7 +327,8 @@ def _run_bert(
             val_dataframe,
             task=task,
             model_id=model_id,
-            revision=revision,
+            revision=effective_revision,
+            token=token,
             parameters=parameters,
         )
         project_drive = mount_drive(drive_root)
@@ -300,10 +340,15 @@ def _run_bert(
             json.dumps(
                 {
                     "model_id": model_id,
-                    "revision": revision,
+                    "requested_revision": revision or "registry_default",
+                    "resolved_revision": effective_revision,
                     "task": task,
                     "hyperparameters": parameters,
                     "training_history": history,
+                    "train_sha256": train_hash,
+                    "validation_sha256": val_hash,
+                    "rag_revision": rag_commit,
+                    "reproducibility": reproducibility,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -329,7 +374,9 @@ def _run_bert(
             task=task,
         )
         retriever = PremiseRetriever.from_rag_directory(
-            rag_path, embedding_device=str(parameters["embedding_device"])
+            rag_path,
+            embedding_revision=str(parameters["embedding_revision"]),
+            embedding_device=str(parameters["embedding_device"]),
         )
         print("Upload one or more .docx court decisions (Cancel to skip document testing).")
         with uploaded_docx_files() as documents:
@@ -356,17 +403,18 @@ def _run_bert(
             {
                 "workflow": "bert",
                 "model_id": model_id,
-                "requested_revision": revision,
-                "resolved_revision": getattr(model.config, "_commit_hash", None),
+                "requested_revision": revision or "registry_default",
+                "resolved_revision": effective_revision,
                 "task": task,
                 "parameters": parameters,
-                "train_sha256": file_sha256(train_path),
-                "validation_sha256": file_sha256(val_path),
+                "train_sha256": train_hash,
+                "validation_sha256": val_hash,
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
                 "drive_model_path": model_target,
-                "remaining_nondeterminism": "CUDA kernels may vary by GPU and library version",
+                "reproducibility": reproducibility,
+                "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },
             output_dir=results_dir,
         )
@@ -399,9 +447,10 @@ def run_bert_binary(
     train_path: str | Path | None = None,
     val_path: str | Path | None = None,
     rag_dir: str | Path = DEFAULT_RAG_DIR,
+    rag_revision: str = DEFAULT_RAG_REVISION,
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     model_id: str = DEFAULT_BERT_MODEL,
-    revision: str = "main",
+    revision: str | None = None,
     hyperparameters: Mapping[str, Any] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
@@ -411,6 +460,7 @@ def run_bert_binary(
         train_path=train_path,
         val_path=val_path,
         rag_dir=rag_dir,
+        rag_revision=rag_revision,
         drive_root=drive_root,
         model_id=model_id,
         revision=revision,
@@ -424,9 +474,10 @@ def run_bert_ternary(
     train_path: str | Path | None = None,
     val_path: str | Path | None = None,
     rag_dir: str | Path = DEFAULT_RAG_DIR,
+    rag_revision: str = DEFAULT_RAG_REVISION,
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     model_id: str = DEFAULT_BERT_MODEL,
-    revision: str = "main",
+    revision: str | None = None,
     hyperparameters: Mapping[str, Any] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
@@ -436,6 +487,7 @@ def run_bert_ternary(
         train_path=train_path,
         val_path=val_path,
         rag_dir=rag_dir,
+        rag_revision=rag_revision,
         drive_root=drive_root,
         model_id=model_id,
         revision=revision,

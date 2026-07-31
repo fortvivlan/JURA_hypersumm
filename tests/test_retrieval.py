@@ -1,9 +1,12 @@
 from dataclasses import dataclass
+from pathlib import Path
+import subprocess
 
 import pandas as pd
 
 from jura_hypersumm.retrieval import (
     PremiseRetriever,
+    ensure_rag_repository,
     extract_citation,
 )
 
@@ -79,3 +82,43 @@ def test_ambiguous_citation_falls_back_to_at_most_twenty() -> None:
     assert len(records) == 20
     assert all(record.method == "faiss" for record in records)
     assert vectorstore.calls == [("ст. 18.8 КоАП РФ", 20)]
+
+
+def test_rag_repository_is_checked_out_at_requested_commit(tmp_path: Path) -> None:
+    repository = tmp_path / "rag"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"],
+        check=True,
+    )
+    (repository / "faiss_index").mkdir()
+    (repository / "faiss_index" / "index.faiss").write_bytes(b"index")
+    (repository / "faiss_index" / "index.pkl").write_bytes(b"metadata")
+    (repository / "codex.csv").write_text("text,source\na,s\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "artifacts"],
+        check=True,
+    )
+    pinned = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repository / "README.md").write_text("later change", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "later"],
+        check=True,
+    )
+
+    path, resolved = ensure_rag_repository(repository, revision=pinned)
+
+    assert path == repository
+    assert resolved == pinned

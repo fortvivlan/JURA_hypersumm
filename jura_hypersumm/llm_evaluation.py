@@ -13,17 +13,21 @@ from .colab_support import (
     uploaded_docx_files,
 )
 from .common import (
+    DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
+    DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
     EvaluationTables,
+    configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
     file_sha256,
     load_dataset,
     merge_parameters,
     prompt_sha256,
+    reproducibility_metadata,
+    resolve_huggingface_revision,
     resolve_model,
-    set_random_seed,
     slugify_model_id,
 )
 from .inference import run_document_inference
@@ -48,7 +52,9 @@ DEFAULT_INFERENCE_PARAMETERS: dict[str, Any] = {
     "precision": "auto",
     "retrieval_top_k": 20,
     "embedding_device": "cpu",
+    "embedding_revision": DEFAULT_EMBEDDING_REVISION,
     "seed": 42,
+    "deterministic": True,
 }
 
 
@@ -88,7 +94,8 @@ def run_llm_evaluation(
     val_binary_path: str | Path | None = None,
     val_ternary_path: str | Path | None = None,
     rag_dir: str | Path = DEFAULT_RAG_DIR,
-    revision: str = "main",
+    rag_revision: str = DEFAULT_RAG_REVISION,
+    revision: str | None = None,
     inference_parameters: Mapping[str, Any] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
@@ -100,19 +107,34 @@ def run_llm_evaluation(
     """
     require_colab()
     parameters = merge_parameters(DEFAULT_INFERENCE_PARAMETERS, inference_parameters)
-    set_random_seed(int(parameters["seed"]))
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     spec = resolve_model(model_name)
     binary_path = Path(val_binary_path or default_dataset_path("val", "binary"))
     ternary_path = Path(val_ternary_path or default_dataset_path("val", "ternary"))
+    binary_hash = file_sha256(binary_path)
+    ternary_hash = file_sha256(ternary_path)
+    reproducibility = reproducibility_metadata(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     datasets = {
         "binary": load_dataset(binary_path, "binary"),
         "ternary": load_dataset(ternary_path, "ternary"),
     }
-    rag_path, rag_commit = ensure_rag_repository(rag_dir)
+    token = get_huggingface_token()
+    effective_revision = resolve_huggingface_revision(
+        spec.model_id, revision or spec.revision, token=token
+    )
+    rag_path, rag_commit = ensure_rag_repository(
+        rag_dir, revision=rag_revision
+    )
     loaded = load_causal_model(
         spec,
-        revision=revision,
-        token=get_huggingface_token(),
+        revision=effective_revision,
+        token=token,
         quantization=bool(parameters["quantization"]),
         device_map=parameters["device_map"],
         precision=str(parameters["precision"]),
@@ -133,7 +155,9 @@ def run_llm_evaluation(
             predictors[task] = predictor
 
         retriever = PremiseRetriever.from_rag_directory(
-            rag_path, embedding_device=str(parameters["embedding_device"])
+            rag_path,
+            embedding_revision=str(parameters["embedding_revision"]),
+            embedding_device=str(parameters["embedding_device"]),
         )
         document_aggregates = []
         document_pairs = []
@@ -183,17 +207,18 @@ def run_llm_evaluation(
             {
                 "workflow": "ready_llm_evaluation",
                 "model_id": spec.model_id,
-                "requested_revision": revision,
-                "resolved_revision": getattr(loaded.model.config, "_commit_hash", None),
+                "requested_revision": revision or "registry_default",
+                "resolved_revision": effective_revision,
                 "parameters": parameters,
-                "binary_validation_sha256": file_sha256(binary_path),
-                "ternary_validation_sha256": file_sha256(ternary_path),
+                "binary_validation_sha256": binary_hash,
+                "ternary_validation_sha256": ternary_hash,
                 "binary_prompt_sha256": prompt_sha256(prompt_for_task("binary")),
                 "ternary_prompt_sha256": prompt_sha256(prompt_for_task("ternary")),
                 "rag_commit": rag_commit,
                 "compute_dtype": loaded.compute_dtype,
                 "summary_enabled": False,
-                "remaining_nondeterminism": "CUDA kernels and quantized generation may vary by hardware/library version",
+                "reproducibility": reproducibility,
+                "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },
             output_dir=results_dir,
         )

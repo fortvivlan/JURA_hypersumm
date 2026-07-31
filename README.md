@@ -65,8 +65,17 @@ Start a GPU runtime, then clone and install the repository:
 ```python
 !git clone https://github.com/fortvivlan/JURA_hypersumm.git /content/JURA_hypersumm
 %cd /content/JURA_hypersumm
-%pip install -q -e ".[colab]"
+%pip install -q uv
+!uv export --extra colab --no-dev --no-emit-project --frozen \
+  --output-file /tmp/jura-requirements.txt
+%pip install -q --upgrade -r /tmp/jura-requirements.txt
+%pip install -q --no-deps -e .
 ```
+
+Restart the Colab runtime after installation, then return to
+`/content/JURA_hypersumm` before importing the workflows. Exporting from
+`uv.lock` installs the exact dependency versions used by the experiment rather
+than whichever compatible versions happen to be newest.
 
 The package reads `train_binary.csv`, `train_ternary.csv`, `val_binary.csv`,
 and `val_ternary.csv` directly from this clone. At inference time it clones
@@ -209,3 +218,44 @@ matches, and preserves the premise responsible for every contradiction. A
 document without `ПОСТАНОВИЛ` is reported and skipped. Uploaded `.docx` files
 are isolated in a temporary directory and deleted after processing even if an
 error occurs.
+
+## Reproducibility
+
+Strict deterministic execution is enabled by default for BERT, ready-LLM, and
+LoRA workflows. Each run:
+
+- seeds Python, NumPy, PyTorch, CUDA, trainer sampling, and BERT data-loader
+  workers with the recorded seed (42 by default);
+- enables deterministic PyTorch algorithms and deterministic cuBLAS/cuDNN,
+  disables cuDNN benchmarking and TF32, and uses greedy LLM generation;
+- pins BERT and RAG embeddings to an immutable Hugging Face commit, pins
+  Ministral, Qwen, and T-lite to immutable model commits, and checks out an
+  immutable `dms-rag` commit;
+- resolves gated Llama to an immutable commit using `HF_TOKEN` before loading
+  it;
+- records SHA-256 hashes for train/validation CSVs, uploaded documents,
+  prompts, and executable source files;
+- records the repository commit/dirty state, hyperparameters, resolved model
+  and RAG commits, package and Python versions, CUDA, cuDNN, and GPU model in
+  the result workbook. Trained-model `run_config.json` files contain the
+  corresponding manifest in Drive.
+
+For an exact rerun, use the same repository commit and `uv.lock`, unchanged
+input files, the recorded hyperparameters and resolved revisions, and the same
+GPU model/driver/CUDA stack. For example, a later Llama rerun should pass the
+`resolved_revision` value from the first workbook:
+
+```python
+scores = run(
+    "llama",
+    "ternary",
+    revision="<40-character resolved_revision from run_metadata>",
+)
+```
+
+Bitwise equality is not guaranteed across different GPU architectures or CUDA
+drivers because their floating-point kernels differ. Under strict mode, an
+operation that PyTorch knows cannot be deterministic raises an error instead
+of silently producing a non-reproducible run. Setting
+`hyperparameters={"deterministic": False}` (or the corresponding ready-LLM
+inference parameter) explicitly opts out of this guarantee.

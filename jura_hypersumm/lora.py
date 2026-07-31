@@ -16,17 +16,21 @@ from .colab_support import (
 )
 from .common import (
     DEFAULT_DRIVE_ROOT,
+    DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
+    DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
     Task,
+    configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
     file_sha256,
     load_dataset,
     merge_parameters,
     prompt_sha256,
+    reproducibility_metadata,
+    resolve_huggingface_revision,
     resolve_model,
-    set_random_seed,
     slugify_model_id,
     validate_task,
 )
@@ -65,7 +69,9 @@ DEFAULT_LORA_HYPERPARAMETERS: dict[str, Any] = {
     "max_new_tokens": 16,
     "retrieval_top_k": 20,
     "embedding_device": "cpu",
+    "embedding_revision": DEFAULT_EMBEDDING_REVISION,
     "seed": 42,
+    "deterministic": True,
 }
 
 
@@ -206,6 +212,7 @@ def _train_adapter(
         dataloader_num_workers=int(parameters["num_workers"]),
         seed=int(parameters["seed"]),
         data_seed=int(parameters["seed"]),
+        full_determinism=bool(parameters["deterministic"]),
     )
     collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -243,8 +250,9 @@ def run(
     train_path: str | Path | None = None,
     val_path: str | Path | None = None,
     rag_dir: str | Path = DEFAULT_RAG_DIR,
+    rag_revision: str = DEFAULT_RAG_REVISION,
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
-    revision: str = "main",
+    revision: str | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
     """Train, validate, save, and document-test one supported task LoRA adapter.
@@ -258,20 +266,34 @@ def run(
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
     parameters = merge_parameters(DEFAULT_LORA_HYPERPARAMETERS, hyperparameters)
-    set_random_seed(int(parameters["seed"]))
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     train_path = Path(train_path or default_dataset_path("train", validated_task))
     val_path = Path(val_path or default_dataset_path("val", validated_task))
+    train_hash = file_sha256(train_path)
+    val_hash = file_sha256(val_path)
+    reproducibility = reproducibility_metadata(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     train_dataframe = load_dataset(train_path, validated_task)
     val_dataframe = load_dataset(val_path, validated_task)
-    rag_path, rag_commit = ensure_rag_repository(rag_dir)
     token = get_huggingface_token()
+    effective_revision = resolve_huggingface_revision(
+        spec.model_id, revision or spec.revision, token=token
+    )
+    rag_path, rag_commit = ensure_rag_repository(
+        rag_dir, revision=rag_revision
+    )
     model = tokenizer = None
     try:
         model, tokenizer, compute_dtype, history, training_metrics = _train_adapter(
             train_dataframe,
             spec=spec,
             task=validated_task,
-            revision=revision,
+            revision=effective_revision,
             token=token,
             parameters=parameters,
         )
@@ -290,10 +312,18 @@ def run(
             json.dumps(
                 {
                     "model_id": spec.model_id,
-                    "revision": revision,
+                    "requested_revision": revision or "registry_default",
+                    "resolved_revision": effective_revision,
                     "task": validated_task,
                     "hyperparameters": parameters,
                     "training_metrics": training_metrics,
+                    "train_sha256": train_hash,
+                    "validation_sha256": val_hash,
+                    "prompt_sha256": prompt_sha256(
+                        prompt_for_task(validated_task)
+                    ),
+                    "rag_revision": rag_commit,
+                    "reproducibility": reproducibility,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -321,7 +351,9 @@ def run(
             task=validated_task,
         )
         retriever = PremiseRetriever.from_rag_directory(
-            rag_path, embedding_device=str(parameters["embedding_device"])
+            rag_path,
+            embedding_revision=str(parameters["embedding_revision"]),
+            embedding_device=str(parameters["embedding_device"]),
         )
         document_predictor = CausalPredictor(
             model,
@@ -358,19 +390,20 @@ def run(
             {
                 "workflow": "lora",
                 "model_id": spec.model_id,
-                "requested_revision": revision,
-                "resolved_revision": getattr(model.config, "_commit_hash", None),
+                "requested_revision": revision or "registry_default",
+                "resolved_revision": effective_revision,
                 "task": validated_task,
                 "parameters": parameters,
                 "training_metrics": training_metrics,
-                "train_sha256": file_sha256(train_path),
-                "validation_sha256": file_sha256(val_path),
+                "train_sha256": train_hash,
+                "validation_sha256": val_hash,
                 "prompt_sha256": prompt_sha256(prompt_for_task(validated_task)),
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
                 "drive_adapter_path": adapter_target,
-                "remaining_nondeterminism": "CUDA kernels and quantized training may vary by hardware/library version",
+                "reproducibility": reproducibility,
+                "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },
             output_dir=results_dir,
         )

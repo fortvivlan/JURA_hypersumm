@@ -8,7 +8,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .common import DEFAULT_RAG_REPOSITORY
+from .common import (
+    DEFAULT_EMBEDDING_REVISION,
+    DEFAULT_RAG_REPOSITORY,
+    DEFAULT_RAG_REVISION,
+)
 
 
 @dataclass(frozen=True)
@@ -74,13 +78,44 @@ def extract_citation(text: str) -> Citation:
 def ensure_rag_repository(
     rag_dir: str | Path,
     repository_url: str = DEFAULT_RAG_REPOSITORY,
+    revision: str = DEFAULT_RAG_REVISION,
 ) -> tuple[Path, str]:
-    """Clone the RAG repository if needed and return its path and commit."""
+    """Clone/check out an immutable RAG revision and return its commit."""
     path = Path(rag_dir)
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["git", "clone", "--depth", "1", repository_url, str(path)],
+            check=True,
+        )
+    current_commit = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if current_commit != revision:
+        dirty = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty:
+            raise RuntimeError(
+                f"Cannot check out RAG revision {revision}: {path} has local changes"
+            )
+        exists = subprocess.run(
+            ["git", "-C", str(path), "cat-file", "-e", f"{revision}^{{commit}}"],
+            capture_output=True,
+        ).returncode == 0
+        if not exists:
+            subprocess.run(
+                ["git", "-C", str(path), "fetch", "--depth", "1", "origin", revision],
+                check=True,
+            )
+        subprocess.run(
+            ["git", "-C", str(path), "checkout", "--detach", revision],
             check=True,
         )
     codex_path = path / "codex.csv"
@@ -97,6 +132,10 @@ def ensure_rag_repository(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    if commit != revision:
+        raise RuntimeError(
+            f"RAG revision mismatch: expected {revision}, checked out {commit}"
+        )
     return path, commit
 
 
@@ -116,6 +155,7 @@ class PremiseRetriever:
         rag_dir: str | Path,
         *,
         embedding_model: str = "ai-forever/sbert_large_nlu_ru",
+        embedding_revision: str = DEFAULT_EMBEDDING_REVISION,
         embedding_device: str = "cpu",
     ) -> "PremiseRetriever":
         """Load trusted cloned codex and FAISS artifacts."""
@@ -127,7 +167,10 @@ class PremiseRetriever:
         dataframe = pd.read_csv(rag_dir / "codex.csv")
         embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model,
-            model_kwargs={"device": embedding_device},
+            model_kwargs={
+                "device": embedding_device,
+                "revision": embedding_revision,
+            },
         )
         vectorstore = FAISS.load_local(
             rag_dir / "faiss_index",
