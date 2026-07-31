@@ -78,14 +78,27 @@ class BertPredictor:
         self.max_length = max_length
 
     def predict_examples(
-        self, premises: Sequence[str], hypotheses: Sequence[str]
+        self,
+        premises: Sequence[str],
+        hypotheses: Sequence[str],
+        *,
+        progress_description: str | None = None,
     ) -> list[ModelPrediction]:
         if len(premises) != len(hypotheses):
             raise ValueError("Premises and hypotheses must have equal length")
         import torch
 
         predictions: list[ModelPrediction] = []
-        for start in range(0, len(premises), self.batch_size):
+        batch_starts = range(0, len(premises), self.batch_size)
+        if progress_description is not None:
+            from tqdm.auto import tqdm
+
+            batch_starts = tqdm(
+                batch_starts,
+                desc=progress_description,
+                unit="batch",
+            )
+        for start in batch_starts:
             encoded = self.tokenizer(
                 list(premises[start : start + self.batch_size]),
                 list(hypotheses[start : start + self.batch_size]),
@@ -469,6 +482,7 @@ def _run_bert(
         validation = predictor.predict_examples(
             val_dataframe["premise"].tolist(),
             val_dataframe["hypothesis"].tolist(),
+            progress_description=f"Validating BERT {task}",
         )
         evaluation = evaluate_predictions(
             val_dataframe,

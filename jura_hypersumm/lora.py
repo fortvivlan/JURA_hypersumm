@@ -5,14 +5,13 @@ from __future__ import annotations
 import gc
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .colab_support import (
-    download_file,
+    deliver_file,
     get_huggingface_token,
-    mount_drive,
-    require_colab,
-    uploaded_docx_files,
+    prepare_artifact_root,
+    selected_docx_files,
 )
 from .common import (
     DEFAULT_DRIVE_ROOT,
@@ -39,7 +38,11 @@ from .common import (
 )
 from .inference import run_document_inference
 from .llm_common import CausalPredictor, load_causal_model
-from .prompting import build_training_texts, prompt_for_task
+from .prompting import (
+    build_ministral_training_texts,
+    build_training_texts,
+    prompt_for_task,
+)
 from .reporting import (
     display_scores,
     write_document_review_package,
@@ -77,6 +80,17 @@ DEFAULT_LORA_HYPERPARAMETERS: dict[str, Any] = {
     "deterministic": True,
 }
 
+STANDARD_PROMPT_PROCESSING = "standard_chat_template_v1"
+MINISTRAL_PROMPT_PROCESSING = "ministral_duplicated_system_prompt_v1"
+
+
+def _prompt_processing_strategy(model_alias: str) -> str:
+    return (
+        MINISTRAL_PROMPT_PROCESSING
+        if model_alias == "ministral"
+        else STANDARD_PROMPT_PROCESSING
+    )
+
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:
     length = 0
@@ -87,17 +101,30 @@ def _common_prefix_length(left: list[int], right: list[int]) -> int:
     return length
 
 
-def _tokenize_training_rows(dataframe, tokenizer, task: Task, max_length: int):
+def _tokenize_training_rows(
+    dataframe,
+    tokenizer,
+    task: Task,
+    max_length: int,
+    *,
+    model_alias: str,
+):
     """Tokenize SFT rows while preserving both prompt context and label tokens."""
     from tqdm.auto import tqdm
 
+    prompt_processing = _prompt_processing_strategy(model_alias)
+    build_texts = (
+        build_ministral_training_texts
+        if prompt_processing == MINISTRAL_PROMPT_PROCESSING
+        else build_training_texts
+    )
     rows: list[dict[str, list[int]]] = []
     for row in tqdm(
         dataframe.itertuples(index=False),
         total=len(dataframe),
         desc=f"Formatting {task} training data",
     ):
-        prompt, full = build_training_texts(
+        prompt, full = build_texts(
             tokenizer, row.premise, row.hypothesis, row.tag, task
         )
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -182,6 +209,7 @@ def _train_adapter(
         tokenizer,
         task,
         int(parameters["max_seq_length"]),
+        model_alias=spec.alias,
     )
 
     class TokenDataset(Dataset):
@@ -296,28 +324,30 @@ def run(
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     revision: str | None = None,
     use_existing_model: bool = False,
+    document_paths: Sequence[str | Path] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
     """Train or reuse, validate, and document-test one task LoRA adapter.
 
     ``hyperparameters`` may override any key in
     :data:`DEFAULT_LORA_HYPERPARAMETERS`; unknown keys are rejected.
-    With ``use_existing_model=True``, the compatible final adapter in Drive is
-    required and training is skipped.
+    With ``use_existing_model=True``, the compatible final adapter in artifact
+    storage is required and training is skipped. Outside Colab, pass explicit
+    local ``drive_root``, ``rag_dir``, ``results_dir``, and ``document_paths``.
     The function returns the main validation score table and downloads a
-    detailed XLSX workbook in Google Colab.
+    detailed XLSX workbook.
     """
-    require_colab()
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
+    prompt_processing = _prompt_processing_strategy(spec.alias)
     workflow = f"lora/{spec.alias}/{validated_task}"
-    announce_stage(workflow, "setup", "Preparing datasets and Google Drive paths.")
+    announce_stage(workflow, "setup", "Preparing datasets and artifact paths.")
     train_path = Path(train_path or default_dataset_path("train", validated_task))
     val_path = Path(val_path or default_dataset_path("val", validated_task))
     train_hash = file_sha256(train_path)
     val_hash = file_sha256(val_path)
     current_prompt_hash = prompt_sha256(prompt_for_task(validated_task))
-    project_drive = mount_drive(drive_root)
+    project_drive = prepare_artifact_root(drive_root)
     adapter_target = (
         project_drive
         / "models"
@@ -346,6 +376,7 @@ def run(
                 "train_sha256": train_hash,
                 "validation_sha256": val_hash,
                 "prompt_sha256": current_prompt_hash,
+                "prompt_processing": prompt_processing,
             },
         )
         stored_parameters = artifact_manifest.get("hyperparameters")
@@ -395,7 +426,7 @@ def run(
             announce_stage(
                 workflow,
                 "load",
-                "Loading the saved LoRA adapter from Drive; training is skipped.",
+                "Loading the saved LoRA adapter; training is skipped.",
             )
             model, tokenizer, compute_dtype = _load_saved_adapter(
                 adapter_target,
@@ -438,6 +469,7 @@ def run(
                         "train_sha256": train_hash,
                         "validation_sha256": val_hash,
                         "prompt_sha256": current_prompt_hash,
+                        "prompt_processing": prompt_processing,
                         "rag_revision": rag_commit,
                         "reproducibility": reproducibility,
                     },
@@ -468,6 +500,7 @@ def run(
         generated = predictor.predict_examples(
             val_dataframe["premise"].tolist(),
             val_dataframe["hypothesis"].tolist(),
+            progress_description=f"Validating LoRA {validated_task}",
         )
         evaluation = evaluate_predictions(
             val_dataframe,
@@ -495,9 +528,9 @@ def run(
         announce_stage(
             workflow,
             "testing",
-            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+            "Document testing is ready. Select or provide DOCX files, or skip it.",
         )
-        with uploaded_docx_files() as documents:
+        with selected_docx_files(document_paths) as documents:
             if documents:
                 announce_stage(
                     workflow,
@@ -544,10 +577,12 @@ def run(
                 "train_sha256": train_hash,
                 "validation_sha256": val_hash,
                 "prompt_sha256": current_prompt_hash,
+                "prompt_processing": prompt_processing,
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
                 "drive_adapter_path": adapter_target,
+                "artifact_path": adapter_target,
                 "used_existing_model": artifact_manifest is not None,
                 "training_skipped": artifact_manifest is not None,
                 "artifact_hyperparameters": (
@@ -566,9 +601,9 @@ def run(
             output_dir=results_dir,
         )
         display_scores(evaluation.scores)
-        download_file(workbook)
+        deliver_file(workbook)
         if review_package is not None:
-            download_file(review_package)
+            deliver_file(review_package)
         announce_stage(workflow, "complete", "Workflow finished.")
         return evaluation.scores
     finally:

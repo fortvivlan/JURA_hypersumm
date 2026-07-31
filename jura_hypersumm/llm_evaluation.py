@@ -77,7 +77,9 @@ def _validate_task(
         max_new_tokens=int(parameters["max_new_tokens"]),
     )
     generated = predictor.predict_examples(
-        dataframe["premise"].tolist(), dataframe["hypothesis"].tolist()
+        dataframe["premise"].tolist(),
+        dataframe["hypothesis"].tolist(),
+        progress_description=f"Validating ready LLM {task}",
     )
     tables = evaluate_predictions(
         dataframe,

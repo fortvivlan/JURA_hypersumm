@@ -7,18 +7,26 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
+
+
+def is_colab() -> bool:
+    """Return whether the current interpreter is running in Google Colab."""
+    try:
+        import google.colab  # noqa: F401
+
+        return True
+    except ModuleNotFoundError:
+        return False
 
 
 def require_colab() -> None:
     """Raise a clear error when a Colab-only workflow runs elsewhere."""
-    try:
-        import google.colab  # noqa: F401
-    except ModuleNotFoundError as error:
+    if not is_colab():
         raise RuntimeError(
             "This workflow must run in Google Colab because it mounts Drive "
             "and asks the user to upload DOCX files."
-        ) from error
+        )
 
 
 def get_huggingface_token() -> str | None:
@@ -51,6 +59,15 @@ def mount_drive(drive_root: str | Path) -> Path:
     return root
 
 
+def prepare_artifact_root(root: str | Path) -> Path:
+    """Mount Drive in Colab or create and return an explicit local root."""
+    if is_colab():
+        return mount_drive(root)
+    local_root = Path(root).expanduser().resolve()
+    local_root.mkdir(parents=True, exist_ok=True)
+    return local_root
+
+
 @contextmanager
 def uploaded_docx_files() -> Iterator[list[Path]]:
     """Upload DOCX files into a temporary directory and always delete them."""
@@ -77,9 +94,46 @@ def uploaded_docx_files() -> Iterator[list[Path]]:
         shutil.rmtree(temporary, ignore_errors=True)
 
 
+@contextmanager
+def selected_docx_files(
+    document_paths: Sequence[str | Path] | None = None,
+) -> Iterator[list[Path]]:
+    """Use explicit local DOCX paths or Colab's temporary upload interface.
+
+    Explicit files belong to the caller and are never removed. Files uploaded
+    through Colab retain the existing temporary-file cleanup behavior.
+    """
+    if document_paths is None:
+        if is_colab():
+            with uploaded_docx_files() as uploaded:
+                yield uploaded
+        else:
+            yield []
+        return
+    paths = [Path(path).expanduser().resolve() for path in document_paths]
+    invalid = [
+        path
+        for path in paths
+        if path.suffix.lower() != ".docx" or not path.is_file()
+    ]
+    if invalid:
+        raise FileNotFoundError(
+            "Invalid or missing DOCX input(s): " + ", ".join(map(str, invalid))
+        )
+    yield sorted(paths, key=lambda item: item.name.lower())
+
+
 def download_file(path: str | Path) -> None:
     """Download one generated artifact from Colab."""
     require_colab()
     from google.colab import files
 
     files.download(str(path))
+
+
+def deliver_file(path: str | Path) -> None:
+    """Download an artifact in Colab or report its resolved local path."""
+    if is_colab():
+        download_file(path)
+    else:
+        print(f"[JURA][results][LOCAL] Saved artifact: {Path(path).resolve()}", flush=True)

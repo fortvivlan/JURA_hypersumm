@@ -3,12 +3,10 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pandas as pd
-from openpyxl import load_workbook
-
 from jura_hypersumm.reporting import write_document_review_package
 
 
-def test_document_review_package_contains_model_and_top1_rag_workbooks(
+def test_document_review_package_contains_only_model_workbooks_with_articles(
     tmp_path: Path,
 ) -> None:
     pairs = pd.DataFrame(
@@ -73,7 +71,6 @@ def test_document_review_package_contains_model_and_top1_rag_workbooks(
         assert set(archive.namelist()) == {
             "decision_binary_model_predictions.xlsx",
             "decision_ternary_model_predictions.xlsx",
-            "decision_rag_retrieval.xlsx",
         }
         model = pd.read_excel(
             BytesIO(archive.read("decision_binary_model_predictions.xlsx"))
@@ -81,36 +78,31 @@ def test_document_review_package_contains_model_and_top1_rag_workbooks(
         assert list(model.columns) == [
             "hypothesis",
             "premise",
+            "article_number",
             "model_prediction",
             "expert_label",
             "expert_comment",
         ]
         assert len(model) == 3
-
-        rag = pd.read_excel(BytesIO(archive.read("decision_rag_retrieval.xlsx")))
-        assert list(rag.columns) == [
-            "sentence",
-            "article_number",
-            "article_text",
-        ]
-        assert rag.to_dict(orient="records") == [
+        assert model.loc[:, ["hypothesis", "premise", "article_number"]].to_dict(
+            orient="records"
+        ) == [
             {
-                "sentence": "Sentence one.",
-                "article_number": 18.8,
-                "article_text": "top-ranked text",
+                "hypothesis": "Sentence one.",
+                "premise": "top-ranked text",
+                "article_number": "КоАП РФ Статья 18.8 Часть 1",
             },
             {
-                "sentence": "Sentence two.",
-                "article_number": 30.3,
-                "article_text": "article text 30.3",
+                "hypothesis": "Sentence one.",
+                "premise": "second-ranked text",
+                "article_number": "КоАП РФ Статья 18.8 Часть 2",
+            },
+            {
+                "hypothesis": "Sentence two.",
+                "premise": "article text 30.3",
+                "article_number": "КоАП РФ Статья 30.3 Часть 1",
             },
         ]
-        rag_workbook = load_workbook(
-            BytesIO(archive.read("decision_rag_retrieval.xlsx")), read_only=True
-        )
-        article_cell = rag_workbook["rag_retrieval"]["B2"]
-        assert article_cell.value == "18.8"
-        assert article_cell.data_type == "s"
 
 
 def test_document_review_package_is_skipped_without_pairs(tmp_path: Path) -> None:

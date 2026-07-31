@@ -78,6 +78,11 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Local experiment artifacts and sensitive input documents
+/local_artifacts/
+/local_results/
+/local_docx/
+
 # IPython
 profile_default/
 ipython_config.py

@@ -9,6 +9,12 @@ POSTANOVIL_PATTERN = re.compile(
     r"П\s*О\s*С\s*Т\s*А\s*Н\s*О\s*В\s*И\s*Л\s*[:.]?",
     flags=re.IGNORECASE,
 )
+IRRELEVANT_SENTENCE_MARKERS = (
+    "реквизит",
+    "ре...изит",
+    "квитанци",
+    "судья",
+)
 
 
 def read_docx_text(path: str | Path) -> str:
@@ -37,3 +43,9 @@ def split_russian_sentences(text: str) -> list[str]:
     from razdel import sentenize
 
     return [sentence.text.strip() for sentence in sentenize(text) if sentence.text.strip()]
+
+
+def textcheck(text: str) -> bool:
+    """Return whether a sentence is irrelevant to codex contradiction checks."""
+    normalized = text.lower()
+    return any(marker in normalized for marker in IRRELEVANT_SENTENCE_MARKERS)

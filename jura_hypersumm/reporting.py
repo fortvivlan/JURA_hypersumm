@@ -67,14 +67,44 @@ def _safe_artifact_name(value: str, *, limit: int = 80) -> str:
     return (cleaned or "document")[:limit]
 
 
-def _article_number(source: object, citation_article: object = None) -> str:
-    """Extract a dotted article number from retrieved-source metadata."""
-    match = re.search(r"(?i)Статья\s+([0-9]+(?:\.[0-9]+)*)", str(source or ""))
-    if match:
-        return match.group(1)
-    if citation_article is None or str(citation_article) == "nan":
+def _metadata_text(value: object) -> str:
+    if value is None or str(value) == "nan":
         return ""
-    return str(citation_article)
+    return str(value).strip()
+
+
+def _article_reference(
+    source: object,
+    citation_code: object = None,
+    citation_article: object = None,
+    citation_part: object = None,
+    citation_point: object = None,
+) -> str:
+    """Format a retrieved codex source like a train/validation source label."""
+    source_text = _metadata_text(source)
+    article_match = re.search(
+        r"(?i)\bСтатья\s+([0-9]+(?:\.[0-9]+)*)", source_text
+    )
+    if article_match:
+        code = source_text[: article_match.start()].strip().rstrip(":.;").strip()
+        article = article_match.group(1)
+        remainder = source_text[article_match.end() :]
+        part_match = re.search(
+            r"(?i)(?:\bп\.|\bч\.|\bчасть|\bпункт)\s*"
+            r"([0-9]+(?:[.-][0-9]+)*)",
+            remainder,
+        )
+        part = part_match.group(1) if part_match else ""
+    else:
+        code = _metadata_text(citation_code)
+        article = _metadata_text(citation_article)
+        part = _metadata_text(citation_point) or _metadata_text(citation_part)
+    if not article:
+        return ""
+    components = [code, f"Статья {article}"] if code else [f"Статья {article}"]
+    if part:
+        components.append(f"Часть {part}")
+    return " ".join(components)
 
 
 def write_document_review_package(
@@ -83,21 +113,17 @@ def write_document_review_package(
     *,
     output_dir: str | Path = DEFAULT_RESULTS_DIR,
 ) -> Path | None:
-    """Create a ZIP of per-document model and top-1 RAG review workbooks.
+    """Create a ZIP containing one model-review workbook per document/task.
 
     Every document/task model workbook contains all classified premise pairs
-    and blank specialist fields for later scoring. Every document RAG workbook
-    contains exactly one top-ranked retrieved article per processed sentence.
-    ``None`` is returned when no document pairs were produced.
+    with formatted codex/article references and blank specialist fields for
+    later scoring. ``None`` is returned when no document pairs were produced.
     """
-    import pandas as pd
-
     if document_pairs is None or document_pairs.empty:
         return None
     required = {
         "document",
         "task",
-        "hypothesis_id",
         "sentence_index",
         "hypothesis",
         "premise",
@@ -129,6 +155,20 @@ def write_document_review_package(
                 model_review = task_rows.loc[
                     :, ["hypothesis", "premise", "prediction"]
                 ].rename(columns={"prediction": "model_prediction"})
+                model_review.insert(
+                    2,
+                    "article_number",
+                    [
+                        _article_reference(
+                            row.source,
+                            getattr(row, "citation_code", None),
+                            getattr(row, "citation_article", None),
+                            getattr(row, "citation_part", None),
+                            getattr(row, "citation_point", None),
+                        )
+                        for row in task_rows.itertuples(index=False)
+                    ],
+                )
                 model_review["expert_label"] = ""
                 model_review["expert_comment"] = ""
                 model_path = temporary / (
@@ -137,33 +177,6 @@ def write_document_review_package(
                 model_review.to_excel(
                     model_path, sheet_name="model_predictions", index=False
                 )
-
-            # Retrieval is identical for tasks using the same document. Keep
-            # the best-ranked candidate once per original sentence.
-            top_retrieval = (
-                document_rows.sort_values(
-                    ["sentence_index", "retrieval_rank", "task"], kind="stable"
-                )
-                .drop_duplicates(subset=["hypothesis_id"], keep="first")
-                .copy()
-            )
-            top_retrieval["article_number"] = [
-                _article_number(source, citation)
-                for source, citation in zip(
-                    top_retrieval["source"],
-                    top_retrieval.get(
-                        "citation_article",
-                        pd.Series([None] * len(top_retrieval), index=top_retrieval.index),
-                    ),
-                )
-            ]
-            rag_review = top_retrieval.loc[
-                :, ["hypothesis", "article_number", "premise"]
-            ].rename(
-                columns={"hypothesis": "sentence", "premise": "article_text"}
-            )
-            rag_path = temporary / f"{document_slug}_rag_retrieval.xlsx"
-            rag_review.to_excel(rag_path, sheet_name="rag_retrieval", index=False)
 
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
             for workbook in sorted(temporary.glob("*.xlsx")):

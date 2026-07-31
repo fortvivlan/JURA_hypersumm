@@ -92,6 +92,46 @@ def build_training_texts(
     return prompt, full
 
 
+def build_ministral_training_texts(
+    tokenizer: Any,
+    premise: str,
+    hypothesis: str,
+    label: str,
+    task: Task,
+) -> tuple[str, str]:
+    """Return prefix-compatible Ministral prompt and labeled training text.
+
+    Ministral's chat template omits the system message when an assistant turn
+    follows the user turn. Duplicating the canonical prompt at the start of the
+    training user message preserves it in the rendered conversation. The two
+    newlines match the separator used by the same template for generation, so
+    the labeled text is an exact continuation of the inference prompt.
+    """
+    if label not in LABELS_BY_TASK[task]:
+        raise ValueError(f"Invalid {task} label: {label!r}")
+    prompt = build_generation_prompt(tokenizer, premise, hypothesis, task)
+    messages = build_messages(
+        premise,
+        hypothesis,
+        task,
+        assistant_label=label,
+    )
+    messages[1]["content"] = (
+        f"{prompt_for_task(task)}\n\n{messages[1]['content']}"
+    )
+    full = apply_chat_template(
+        tokenizer,
+        messages,
+        add_generation_prompt=False,
+    )
+    if not full.startswith(prompt):
+        raise ValueError(
+            "Ministral training text is not an exact continuation of its "
+            "generation prompt; the tokenizer chat template may have changed"
+        )
+    return prompt, full
+
+
 def parse_generated_label(text: str, task: Task) -> str | None:
     """Parse exactly one supported label from generated model text."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)

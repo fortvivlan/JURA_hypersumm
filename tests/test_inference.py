@@ -17,6 +17,15 @@ class FakeRetriever:
         ]
 
 
+class TrackingRetriever(FakeRetriever):
+    def __init__(self) -> None:
+        self.hypotheses = []
+
+    def retrieve(self, hypothesis: str, *, top_k: int):
+        self.hypotheses.append(hypothesis)
+        return super().retrieve(hypothesis, top_k=top_k)
+
+
 class FakePredictor:
     def predict_pairs(self, premises, hypothesis):
         return [
@@ -56,6 +65,40 @@ def test_document_inference_preserves_contradiction_premise(
     assert contradiction["premise"] == "p2"
     assert contradiction["source"] == "source 2"
     assert len(contradiction["document_sha256"]) == 64
+
+
+def test_document_inference_filters_irrelevant_sentences_before_retrieval(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "jura_hypersumm.inference.read_docx_text", lambda path: "ПОСТАНОВИЛ: text"
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.inference.split_russian_sentences",
+        lambda text: [
+            "Судья Петрова.",
+            "Оплатить по реквизитам.",
+            "Банковские ре...изиты.",
+            "Приложить квитанцию.",
+            "Назначить административный штраф.",
+        ],
+    )
+    document_path = tmp_path / "decision.docx"
+    document_path.write_bytes(b"stable document")
+    retriever = TrackingRetriever()
+
+    tables = run_document_inference(
+        [document_path],
+        predictor=FakePredictor(),
+        retriever=retriever,
+        model_id="model",
+        task="binary",
+    )
+
+    assert retriever.hypotheses == ["Назначить административный штраф."]
+    assert set(tables.pairs["hypothesis"]) == {"Назначить административный штраф."}
+    assert set(tables.pairs["sentence_index"]) == {4}
+    assert set(tables.pairs["hypothesis_id"]) == {"decision.docx:00004"}
 
 
 def test_missing_operative_section_is_reported_and_skipped(

@@ -115,9 +115,13 @@ class CausalPredictor:
         self.max_new_tokens = max_new_tokens
 
     def predict_examples(
-        self, premises: Sequence[str], hypotheses: Sequence[str]
+        self,
+        premises: Sequence[str],
+        hypotheses: Sequence[str],
+        *,
+        progress_description: str | None = None,
     ) -> list[ModelPrediction]:
-        """Predict aligned premise/hypothesis examples."""
+        """Predict aligned examples, optionally displaying batch progress."""
         if len(premises) != len(hypotheses):
             raise ValueError("Premises and hypotheses must have equal length")
         torch = require_cuda()
@@ -127,7 +131,16 @@ class CausalPredictor:
         ]
         predictions: list[ModelPrediction] = []
         input_device = model_input_device(self.model)
-        for start in range(0, len(prompts), self.batch_size):
+        batch_starts = range(0, len(prompts), self.batch_size)
+        if progress_description is not None:
+            from tqdm.auto import tqdm
+
+            batch_starts = tqdm(
+                batch_starts,
+                desc=progress_description,
+                unit="batch",
+            )
+        for start in batch_starts:
             batch = prompts[start : start + self.batch_size]
             inputs = self.tokenizer(
                 batch,

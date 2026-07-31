@@ -188,10 +188,12 @@ scores = run("ministral", "ternary", use_existing_model=True)
 ```
 
 The adapter manifest must match the model ID, task, base-model revision,
-prompt, and current train/validation file hashes. A missing or incompatible
-adapter raises an error rather than silently launching training. Validation,
-RAG retrieval, document upload, full inference, XLSX generation, ZIP creation,
-and downloads still run normally.
+prompt, prompt-processing strategy, and current train/validation file hashes.
+A missing or incompatible adapter raises an error rather than silently
+launching training. Validation, RAG retrieval, document upload, full inference,
+XLSX generation, ZIP creation, and downloads still run normally. Ministral
+training duplicates the canonical prompt in its user turn to accommodate that
+model's chat template while keeping the inference prompt unchanged.
 
 Final adapters are stored at
 `MyDrive/jura/models/lora/<model_slug>/<binary-or-ternary>`. The default QLoRA
@@ -216,6 +218,41 @@ scores = run(
 
 Unknown hyperparameter names raise an error instead of being ignored.
 
+### Native Windows LoRA notebook
+
+[`lora_local.ipynb`](lora_local.ipynb) runs the same LoRA training, validation,
+RAG, inference, and reporting workflow from a native Windows Jupyter kernel.
+It is not intended for WSL. The selected interpreter must already have the
+project dependencies installed, `git` must be on `PATH`, and an NVIDIA CUDA
+GPU is required.
+
+Open the notebook from within this repository and run its cells in order. Put
+any test decisions in `local_docx/`; an empty folder skips document inference.
+The final cell is:
+
+```python
+scores = run("ministral", "ternary")
+```
+
+The notebook's wrapper passes explicit local paths to the reusable
+`jura_hypersumm.lora.run` function. It clones the pinned RAG repository into
+`dms-rag/`, stores final adapters in `local_artifacts/models/lora/`, and writes
+XLSX/ZIP results to `local_results/`. Local DOCX inputs are never deleted;
+only files uploaded through Colab use temporary storage and automatic cleanup.
+All four directories are ignored by Git.
+
+Set `USE_EXISTING_MODEL = True` in the configuration cell to reuse a compatible
+local adapter. GPU/memory settings can still be supplied by editing the final
+call, for example:
+
+```python
+scores = run(
+    "ministral",
+    "ternary",
+    hyperparameters={"batch_size": 1, "gradient_accumulation_steps": 16},
+)
+```
+
 ### Results and uploaded documents
 
 Every public workflow returns and displays its main `pandas.DataFrame` score
@@ -233,28 +270,27 @@ setup, document testing, and result generation. Training and per-document
 inference retain their batch/sentence progress bars.
 
 When at least one document is successfully analysed, the workflow also
-downloads a ZIP prepared for human review. For every document it contains:
-
-- `<document>_<task>_model_predictions.xlsx`, with every RAG premise/model pair
-  and the columns `hypothesis`, `premise`, `model_prediction`, `expert_label`,
-  and `expert_comment`. A specialist can fill the last two columns so these
-  predictions can later be scored against human labels.
-- `<document>_rag_retrieval.xlsx`, with exactly `sentence`, `article_number`,
-  and `article_text`. It contains the top-ranked article used for each
-  processed sentence and is intended for separate manual RAG evaluation.
+downloads a ZIP prepared for human review. For every document/task it contains
+`<document>_<task>_model_predictions.xlsx` with every RAG premise/model pair and
+the columns `hypothesis`, `premise`, `article_number`, `model_prediction`,
+`expert_label`, and `expert_comment`. Article values include the codex, dotted
+article number, and part where available, for example
+`КоАП РФ Статья 18.8 Часть 3.1`. A specialist can fill the last two columns so
+the predictions can later be scored against human labels. No separate
+top-ranked RAG workbook is generated; all retrieved candidates remain available
+in the model workbook and in the detailed main results workbook.
 
 LoRA and BERT runs produce one model-prediction workbook per document. A ready
 LLM run produces binary and ternary model-prediction workbooks for each
-document, while sharing one deduplicated RAG workbook. The detailed main
-workbook still retains all retrieval candidates and ranks; only the compact
-RAG review workbook is limited to the top-ranked article per sentence.
+document.
 
 Document inference extracts the final `ПОСТАНОВИЛ` section, splits it with
-`razdel`, performs deterministic citation lookup before a maximum of 20 FAISS
-matches, and preserves the premise responsible for every contradiction. A
-document without `ПОСТАНОВИЛ` is reported and skipped. Uploaded `.docx` files
-are isolated in a temporary directory and deleted after processing even if an
-error occurs.
+`razdel`, removes signatures and payment-detail sentences containing `судья`,
+`реквизит`, `ре...изит`, or `квитанци`, performs deterministic citation lookup
+before a maximum of 20 FAISS matches, and preserves the premise responsible for
+every contradiction. A document without `ПОСТАНОВИЛ` is reported and skipped.
+Uploaded `.docx` files are isolated in a temporary directory and deleted after
+processing even if an error occurs.
 
 ## Reproducibility
 

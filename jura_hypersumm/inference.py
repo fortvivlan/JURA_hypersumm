@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Protocol, Sequence
 
 from .common import LABELS_BY_TASK, Task, file_sha256
-from .documents import extract_operative_section, read_docx_text, split_russian_sentences
+from .documents import (
+    extract_operative_section,
+    read_docx_text,
+    split_russian_sentences,
+    textcheck,
+)
 from .retrieval import PremiseRetriever, citation_dict
 
 
@@ -85,13 +90,17 @@ def run_document_inference(
                     }
                 )
                 continue
-            hypotheses = split_russian_sentences(operative)
-            for sentence_index, hypothesis in enumerate(
-                tqdm(
-                    hypotheses,
-                    desc=f"{document_path.name} [{task}]",
-                    leave=False,
+            hypotheses = [
+                (sentence_index, hypothesis)
+                for sentence_index, hypothesis in enumerate(
+                    split_russian_sentences(operative)
                 )
+                if not textcheck(hypothesis)
+            ]
+            for sentence_index, hypothesis in tqdm(
+                hypotheses,
+                desc=f"{document_path.name} [{task}]",
+                leave=False,
             ):
                 hypothesis_id = f"{document_path.name}:{sentence_index:05d}"
                 retrieved = retriever.retrieve(hypothesis, top_k=top_k)
