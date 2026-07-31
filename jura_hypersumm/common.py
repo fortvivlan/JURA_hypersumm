@@ -89,13 +89,20 @@ def load_dataset(path: str | Path, task: Task):
     if not path.is_file():
         raise FileNotFoundError(f"Dataset does not exist: {path}")
     dataframe = pd.read_csv(path)
-    required = ("premise", "hypothesis", "source", "tag")
-    missing = [column for column in required if column not in dataframe.columns]
+    columns = ("premise", "hypothesis", "source", "tag")
+    missing = [column for column in columns if column not in dataframe.columns]
     if missing:
         raise ValueError(f"{path} is missing columns: {', '.join(missing)}")
-    dataframe = dataframe.loc[:, required].copy()
-    if dataframe[list(required)].isna().any().any():
-        raise ValueError(f"{path} contains missing required values")
+    dataframe = dataframe.loc[:, columns].copy()
+    training_columns = ("premise", "hypothesis", "tag")
+    if dataframe[list(training_columns)].isna().any().any():
+        raise ValueError(
+            f"{path} contains missing premise, hypothesis, or tag values"
+        )
+    # ``source`` is useful audit metadata but is not a model input. The source
+    # datasets contain one legitimately unlabeled source cell, so preserve the
+    # example and use an empty string in exported result tables.
+    dataframe["source"] = dataframe["source"].fillna("").astype(str)
     valid_labels = LABELS_BY_TASK[task]
     invalid = sorted(set(dataframe["tag"]) - set(valid_labels))
     if invalid:

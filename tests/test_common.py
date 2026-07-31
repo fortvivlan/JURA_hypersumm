@@ -41,6 +41,41 @@ def test_load_dataset_uses_explicit_task_labels(tmp_path: Path) -> None:
         load_dataset(path, "binary")
 
 
+def test_load_dataset_accepts_missing_optional_source(tmp_path: Path) -> None:
+    path = tmp_path / "ternary.csv"
+    pd.DataFrame(
+        {
+            "premise": ["p"],
+            "hypothesis": ["h"],
+            "source": [None],
+            "tag": ["entailment"],
+        }
+    ).to_csv(path, index=False)
+
+    dataframe = load_dataset(path, "ternary")
+
+    assert len(dataframe) == 1
+    assert dataframe.loc[0, "source"] == ""
+
+
+@pytest.mark.parametrize("missing_column", ["premise", "hypothesis", "tag"])
+def test_load_dataset_rejects_missing_training_values(
+    tmp_path: Path, missing_column: str
+) -> None:
+    path = tmp_path / f"missing_{missing_column}.csv"
+    row = {
+        "premise": "p",
+        "hypothesis": "h",
+        "source": "s",
+        "tag": "entailment",
+    }
+    row[missing_column] = None
+    pd.DataFrame([row]).to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="missing premise, hypothesis, or tag"):
+        load_dataset(path, "ternary")
+
+
 def test_evaluate_predictions_counts_invalid_as_wrong() -> None:
     dataframe = pd.DataFrame(
         {
