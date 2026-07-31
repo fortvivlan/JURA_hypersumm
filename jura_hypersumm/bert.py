@@ -24,14 +24,17 @@ from .common import (
     DEFAULT_RESULTS_DIR,
     LABEL2ID_BY_TASK,
     Task,
+    announce_stage,
     configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
     file_sha256,
+    load_saved_artifact_manifest,
     load_dataset,
     merge_parameters,
     reproducibility_metadata,
     resolve_huggingface_revision,
+    saved_artifact_revision,
     seed_data_loader_worker,
 )
 from .inference import ModelPrediction, run_document_inference
@@ -105,6 +108,44 @@ class BertPredictor:
         return self.predict_examples(premises, [hypothesis] * len(premises))
 
 
+def _bert_device(parameters: Mapping[str, Any]):
+    import torch
+
+    requested = str(parameters["device"]).lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("A CUDA device was requested but is not available")
+    return device
+
+
+def _load_bert_artifact(
+    artifact_dir: Path,
+    *,
+    task: Task,
+    parameters: Mapping[str, Any],
+):
+    """Load a complete locally saved BERT classifier without network access."""
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    device = _bert_device(parameters)
+    tokenizer = AutoTokenizer.from_pretrained(artifact_dir, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        artifact_dir, local_files_only=True
+    ).to(device)
+    saved_labels = set(model.config.id2label.values())
+    expected_labels = set(LABEL2ID_BY_TASK[task])
+    if saved_labels != expected_labels:
+        raise ValueError(
+            f"Saved BERT labels {sorted(saved_labels)} do not match {task} labels "
+            f"{sorted(expected_labels)}"
+        )
+    model.eval()
+    compute_dtype = str(next(model.parameters()).dtype).removeprefix("torch.")
+    return model, tokenizer, compute_dtype
+
+
 def _train_bert(
     train_dataframe,
     val_dataframe,
@@ -125,12 +166,7 @@ def _train_bert(
         get_linear_schedule_with_warmup,
     )
 
-    requested_device = str(parameters["device"]).lower()
-    if requested_device == "auto":
-        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(requested_device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("A CUDA device was requested but is not available")
+    device = _bert_device(parameters)
     label2id = LABEL2ID_BY_TASK[task]
     id2label = {index: label for label, index in label2id.items()}
     tokenizer = AutoTokenizer.from_pretrained(
@@ -291,70 +327,138 @@ def _run_bert(
     drive_root: str | Path,
     model_id: str,
     revision: str | None,
+    use_existing_model: bool,
     hyperparameters: Mapping[str, Any] | None,
     results_dir: str | Path,
 ):
     require_colab()
-    parameters = merge_parameters(DEFAULT_BERT_PARAMETERS, hyperparameters)
-    configure_reproducibility(
-        int(parameters["seed"]),
-        deterministic=bool(parameters["deterministic"]),
-    )
+    workflow = f"bert/{task}"
+    announce_stage(workflow, "setup", "Preparing datasets and Google Drive paths.")
     train_path = Path(train_path or default_dataset_path("train", task))
     val_path = Path(val_path or default_dataset_path("val", task))
     train_hash = file_sha256(train_path)
     val_hash = file_sha256(val_path)
+    project_drive = mount_drive(drive_root)
+    model_target = project_drive / "models" / "bert" / task
+    artifact_manifest: dict[str, Any] | None = None
+    if use_existing_model:
+        announce_stage(
+            workflow,
+            "reuse",
+            f"Checking the previously trained model at {model_target}.",
+        )
+        artifact_manifest = load_saved_artifact_manifest(
+            model_target,
+            required_files=("run_config.json", "config.json", "tokenizer_config.json"),
+            weight_files=("model.safetensors", "pytorch_model.bin"),
+            expected={
+                "model_id": model_id,
+                "task": task,
+                "train_sha256": train_hash,
+                "validation_sha256": val_hash,
+            },
+        )
+        stored_parameters = artifact_manifest.get("hyperparameters")
+        if not isinstance(stored_parameters, dict):
+            raise ValueError(f"Saved BERT manifest has no hyperparameters: {model_target}")
+        parameters = merge_parameters(DEFAULT_BERT_PARAMETERS, stored_parameters)
+        parameters = merge_parameters(parameters, hyperparameters)
+    else:
+        parameters = merge_parameters(DEFAULT_BERT_PARAMETERS, hyperparameters)
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     reproducibility = reproducibility_metadata(
         int(parameters["seed"]),
         deterministic=bool(parameters["deterministic"]),
     )
-    train_dataframe = load_dataset(train_path, task)
     val_dataframe = load_dataset(val_path, task)
     token = get_huggingface_token()
-    requested_revision = revision or (
-        DEFAULT_BERT_REVISION if model_id == DEFAULT_BERT_MODEL else None
-    )
-    effective_revision = resolve_huggingface_revision(
-        model_id, requested_revision, token=token
-    )
+    if artifact_manifest is not None:
+        effective_revision = saved_artifact_revision(artifact_manifest, model_target)
+        if revision is not None:
+            requested_commit = resolve_huggingface_revision(
+                model_id, revision, token=token
+            )
+            if requested_commit != effective_revision:
+                raise ValueError(
+                    "Requested BERT revision does not match the saved model: "
+                    f"{requested_commit} != {effective_revision}"
+                )
+    else:
+        requested_revision = revision or (
+            DEFAULT_BERT_REVISION if model_id == DEFAULT_BERT_MODEL else None
+        )
+        effective_revision = resolve_huggingface_revision(
+            model_id, requested_revision, token=token
+        )
+    announce_stage(workflow, "rag", "Preparing the pinned RAG repository.")
     rag_path, rag_commit = ensure_rag_repository(
         rag_dir, revision=rag_revision
     )
+    announce_stage(workflow, "rag", f"RAG repository ready at {rag_commit[:12]}.")
     model = tokenizer = None
     try:
-        model, tokenizer, history, compute_dtype = _train_bert(
-            train_dataframe,
-            val_dataframe,
-            task=task,
-            model_id=model_id,
-            revision=effective_revision,
-            token=token,
-            parameters=parameters,
-        )
-        project_drive = mount_drive(drive_root)
-        model_target = project_drive / "models" / "bert" / task
-        model_target.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(model_target, safe_serialization=True)
-        tokenizer.save_pretrained(model_target)
-        (model_target / "run_config.json").write_text(
-            json.dumps(
-                {
-                    "model_id": model_id,
-                    "requested_revision": revision or "registry_default",
-                    "resolved_revision": effective_revision,
-                    "task": task,
-                    "hyperparameters": parameters,
-                    "training_history": history,
-                    "train_sha256": train_hash,
-                    "validation_sha256": val_hash,
-                    "rag_revision": rag_commit,
-                    "reproducibility": reproducibility,
-                },
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            ),
-            encoding="utf-8",
+        if artifact_manifest is not None:
+            announce_stage(
+                workflow,
+                "load",
+                "Loading the trained BERT model from Drive; training is skipped.",
+            )
+            model, tokenizer, compute_dtype = _load_bert_artifact(
+                model_target, task=task, parameters=parameters
+            )
+            history = artifact_manifest.get("training_history", [])
+            announce_stage(workflow, "load", "Saved BERT model loaded.")
+        else:
+            train_dataframe = load_dataset(train_path, task)
+            announce_stage(
+                workflow,
+                "training",
+                f"Starting BERT training on {len(train_dataframe)} examples.",
+            )
+            model, tokenizer, history, compute_dtype = _train_bert(
+                train_dataframe,
+                val_dataframe,
+                task=task,
+                model_id=model_id,
+                revision=effective_revision,
+                token=token,
+                parameters=parameters,
+            )
+            model_target.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(model_target, safe_serialization=True)
+            tokenizer.save_pretrained(model_target)
+            (model_target / "run_config.json").write_text(
+                json.dumps(
+                    {
+                        "model_id": model_id,
+                        "requested_revision": revision or "registry_default",
+                        "resolved_revision": effective_revision,
+                        "task": task,
+                        "hyperparameters": parameters,
+                        "training_history": history,
+                        "train_sha256": train_hash,
+                        "validation_sha256": val_hash,
+                        "rag_revision": rag_commit,
+                        "reproducibility": reproducibility,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            announce_stage(
+                workflow,
+                "training",
+                f"Training finished; final model saved to {model_target}.",
+            )
+        announce_stage(
+            workflow,
+            "validation",
+            f"Starting validation on {len(val_dataframe)} examples.",
         )
         predictor = BertPredictor(
             model,
@@ -373,13 +477,28 @@ def _run_bert(
             model_id=model_id,
             task=task,
         )
+        announce_stage(workflow, "validation", "Validation finished.")
+        announce_stage(workflow, "testing", "Loading the RAG retrieval index.")
         retriever = PremiseRetriever.from_rag_directory(
             rag_path,
             embedding_revision=str(parameters["embedding_revision"]),
             embedding_device=str(parameters["embedding_device"]),
         )
-        print("Upload one or more .docx court decisions (Cancel to skip document testing).")
+        announce_stage(workflow, "testing", "RAG retrieval index loaded.")
+        announce_stage(
+            workflow,
+            "testing",
+            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+        )
         with uploaded_docx_files() as documents:
+            if documents:
+                announce_stage(
+                    workflow,
+                    "testing",
+                    f"Starting full RAG inference for {len(documents)} document(s).",
+                )
+            else:
+                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
             document_tables = run_document_inference(
                 documents,
                 predictor=predictor,
@@ -388,6 +507,9 @@ def _run_bert(
                 task=task,
                 top_k=int(parameters["retrieval_top_k"]),
             )
+        if documents:
+            announce_stage(workflow, "testing", "Full document inference finished.")
+        announce_stage(workflow, "results", "Writing score and review artifacts.")
         workbook = write_results_workbook(
             f"bert_{task}",
             {
@@ -403,7 +525,9 @@ def _run_bert(
             {
                 "workflow": "bert",
                 "model_id": model_id,
-                "requested_revision": revision or "registry_default",
+                "requested_revision": revision or (
+                    "saved_artifact" if artifact_manifest is not None else "registry_default"
+                ),
                 "resolved_revision": effective_revision,
                 "task": task,
                 "parameters": parameters,
@@ -413,6 +537,13 @@ def _run_bert(
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
                 "drive_model_path": model_target,
+                "used_existing_model": artifact_manifest is not None,
+                "training_skipped": artifact_manifest is not None,
+                "artifact_hyperparameters": (
+                    artifact_manifest.get("hyperparameters")
+                    if artifact_manifest is not None
+                    else None
+                ),
                 "reproducibility": reproducibility,
                 "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },
@@ -427,6 +558,7 @@ def _run_bert(
         download_file(workbook)
         if review_package is not None:
             download_file(review_package)
+        announce_stage(workflow, "complete", "Workflow finished.")
         return evaluation.scores
     finally:
         if model is not None:
@@ -451,10 +583,15 @@ def run_bert_binary(
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     model_id: str = DEFAULT_BERT_MODEL,
     revision: str | None = None,
+    use_existing_model: bool = False,
     hyperparameters: Mapping[str, Any] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
-    """Train, validate, save, and document-test the binary BERT baseline."""
+    """Train or reuse, validate, and document-test the binary BERT baseline.
+
+    ``use_existing_model=True`` requires a compatible final model in Drive and
+    skips training completely.
+    """
     return _run_bert(
         "binary",
         train_path=train_path,
@@ -464,6 +601,7 @@ def run_bert_binary(
         drive_root=drive_root,
         model_id=model_id,
         revision=revision,
+        use_existing_model=use_existing_model,
         hyperparameters=hyperparameters,
         results_dir=results_dir,
     )
@@ -478,10 +616,15 @@ def run_bert_ternary(
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     model_id: str = DEFAULT_BERT_MODEL,
     revision: str | None = None,
+    use_existing_model: bool = False,
     hyperparameters: Mapping[str, Any] | None = None,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
-    """Train, validate, save, and document-test the ternary BERT baseline."""
+    """Train or reuse, validate, and document-test the ternary BERT baseline.
+
+    ``use_existing_model=True`` requires a compatible final model in Drive and
+    skips training completely.
+    """
     return _run_bert(
         "ternary",
         train_path=train_path,
@@ -491,6 +634,7 @@ def run_bert_ternary(
         drive_root=drive_root,
         model_id=model_id,
         revision=revision,
+        use_existing_model=use_existing_model,
         hyperparameters=hyperparameters,
         results_dir=results_dir,
     )

@@ -106,6 +106,18 @@ binary_scores = run_bert_binary()
 ternary_scores = run_bert_ternary()
 ```
 
+To skip training and use the compatible final model already stored in Drive:
+
+```python
+binary_scores = run_bert_binary(use_existing_model=True)
+ternary_scores = run_bert_ternary(use_existing_model=True)
+```
+
+Reuse is opt-in and strict. The saved directory must contain complete model,
+tokenizer, and `run_config.json` artifacts matching the requested task, model
+ID, and current train/validation file hashes. If it is absent, incomplete, or
+incompatible, the function raises an error and does not start training.
+
 Models are saved to `MyDrive/jura/models/bert/binary` and
 `MyDrive/jura/models/bert/ternary`. The default is
 `ai-forever/sbert_large_nlu_ru` with length 512, batch size 16, six epochs,
@@ -152,6 +164,10 @@ scores = run_llm_evaluation(
 )
 ```
 
+This ready-LLM workflow has no reuse switch because it never trains or saves a
+fine-tuned model; every call already performs validation and full inference
+only.
+
 ### LoRA/QLoRA fine-tuning
 
 `run(model_name, task, hyperparameters=None)` trains one task adapter for one
@@ -163,6 +179,19 @@ from jura_hypersumm.lora import run
 
 scores = run("ministral", "ternary")
 ```
+
+Every model alias and task can reuse its final adapter from Drive without
+fine-tuning it again:
+
+```python
+scores = run("ministral", "ternary", use_existing_model=True)
+```
+
+The adapter manifest must match the model ID, task, base-model revision,
+prompt, and current train/validation file hashes. A missing or incompatible
+adapter raises an error rather than silently launching training. Validation,
+RAG retrieval, document upload, full inference, XLSX generation, ZIP creation,
+and downloads still run normally.
 
 Final adapters are stored at
 `MyDrive/jura/models/lora/<model_slug>/<binary-or-ternary>`. The default QLoRA
@@ -194,6 +223,14 @@ table. It also downloads one XLSX workbook containing summary and per-class
 metrics, a confusion matrix, raw validation predictions, document-level
 aggregates, every retrieved premise/pair prediction, errors, and reproducibility
 metadata. Results are written under `/content/jura_results`, not Drive.
+Reused-model workbooks record `used_existing_model=True` and
+`training_skipped=True`; their training-history sheet is copied from the saved
+artifact manifest when available.
+
+Long-running Colab workflows print immediately flushed `[JURA]` stage messages
+before and after model loading or reuse, training, each validation task, RAG
+setup, document testing, and result generation. Training and per-document
+inference retain their batch/sentence progress bars.
 
 When at least one document is successfully analysed, the workflow also
 downloads a ZIP prepared for human review. For every document it contains:

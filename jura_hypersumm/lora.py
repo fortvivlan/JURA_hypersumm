@@ -21,16 +21,19 @@ from .common import (
     DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
     Task,
+    announce_stage,
     configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
     file_sha256,
+    load_saved_artifact_manifest,
     load_dataset,
     merge_parameters,
     prompt_sha256,
     reproducibility_metadata,
     resolve_huggingface_revision,
     resolve_model,
+    saved_artifact_revision,
     slugify_model_id,
     validate_task,
 )
@@ -242,6 +245,45 @@ def _train_adapter(
     return model, tokenizer, loaded.compute_dtype, history, training_metrics
 
 
+def _load_saved_adapter(
+    adapter_dir: Path,
+    *,
+    spec,
+    revision: str,
+    token: str | None,
+    parameters: Mapping[str, Any],
+):
+    """Load a saved LoRA adapter over its immutable base-model revision."""
+    from peft import PeftModel
+    from transformers import AutoTokenizer
+
+    loaded = load_causal_model(
+        spec,
+        revision=revision,
+        token=token,
+        quantization=bool(parameters["quantization"]),
+        device_map=parameters["device_map"],
+        precision=str(parameters["precision"]),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        adapter_dir,
+        local_files_only=True,
+        trust_remote_code=spec.trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    model = PeftModel.from_pretrained(
+        loaded.model,
+        adapter_dir,
+        is_trainable=False,
+        local_files_only=True,
+    )
+    model.config.use_cache = True
+    model.eval()
+    return model, tokenizer, loaded.compute_dtype
+
+
 def run(
     model_name: str,
     task: str,
@@ -253,83 +295,167 @@ def run(
     rag_revision: str = DEFAULT_RAG_REVISION,
     drive_root: str | Path = DEFAULT_DRIVE_ROOT,
     revision: str | None = None,
+    use_existing_model: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
-    """Train, validate, save, and document-test one supported task LoRA adapter.
+    """Train or reuse, validate, and document-test one task LoRA adapter.
 
     ``hyperparameters`` may override any key in
     :data:`DEFAULT_LORA_HYPERPARAMETERS`; unknown keys are rejected.
+    With ``use_existing_model=True``, the compatible final adapter in Drive is
+    required and training is skipped.
     The function returns the main validation score table and downloads a
     detailed XLSX workbook in Google Colab.
     """
     require_colab()
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
-    parameters = merge_parameters(DEFAULT_LORA_HYPERPARAMETERS, hyperparameters)
-    configure_reproducibility(
-        int(parameters["seed"]),
-        deterministic=bool(parameters["deterministic"]),
-    )
+    workflow = f"lora/{spec.alias}/{validated_task}"
+    announce_stage(workflow, "setup", "Preparing datasets and Google Drive paths.")
     train_path = Path(train_path or default_dataset_path("train", validated_task))
     val_path = Path(val_path or default_dataset_path("val", validated_task))
     train_hash = file_sha256(train_path)
     val_hash = file_sha256(val_path)
+    current_prompt_hash = prompt_sha256(prompt_for_task(validated_task))
+    project_drive = mount_drive(drive_root)
+    adapter_target = (
+        project_drive
+        / "models"
+        / "lora"
+        / slugify_model_id(spec.model_id)
+        / validated_task
+    )
+    artifact_manifest: dict[str, Any] | None = None
+    if use_existing_model:
+        announce_stage(
+            workflow,
+            "reuse",
+            f"Checking the previously trained adapter at {adapter_target}.",
+        )
+        artifact_manifest = load_saved_artifact_manifest(
+            adapter_target,
+            required_files=(
+                "run_config.json",
+                "adapter_config.json",
+                "tokenizer_config.json",
+            ),
+            weight_files=("adapter_model.safetensors", "adapter_model.bin"),
+            expected={
+                "model_id": spec.model_id,
+                "task": validated_task,
+                "train_sha256": train_hash,
+                "validation_sha256": val_hash,
+                "prompt_sha256": current_prompt_hash,
+            },
+        )
+        stored_parameters = artifact_manifest.get("hyperparameters")
+        if not isinstance(stored_parameters, dict):
+            raise ValueError(
+                f"Saved LoRA manifest has no hyperparameters: {adapter_target}"
+            )
+        parameters = merge_parameters(DEFAULT_LORA_HYPERPARAMETERS, stored_parameters)
+        parameters = merge_parameters(parameters, hyperparameters)
+    else:
+        parameters = merge_parameters(DEFAULT_LORA_HYPERPARAMETERS, hyperparameters)
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
     reproducibility = reproducibility_metadata(
         int(parameters["seed"]),
         deterministic=bool(parameters["deterministic"]),
     )
-    train_dataframe = load_dataset(train_path, validated_task)
     val_dataframe = load_dataset(val_path, validated_task)
     token = get_huggingface_token()
-    effective_revision = resolve_huggingface_revision(
-        spec.model_id, revision or spec.revision, token=token
-    )
+    if artifact_manifest is not None:
+        effective_revision = saved_artifact_revision(
+            artifact_manifest, adapter_target
+        )
+        if revision is not None:
+            requested_commit = resolve_huggingface_revision(
+                spec.model_id, revision, token=token
+            )
+            if requested_commit != effective_revision:
+                raise ValueError(
+                    "Requested base-model revision does not match the saved adapter: "
+                    f"{requested_commit} != {effective_revision}"
+                )
+    else:
+        effective_revision = resolve_huggingface_revision(
+            spec.model_id, revision or spec.revision, token=token
+        )
+    announce_stage(workflow, "rag", "Preparing the pinned RAG repository.")
     rag_path, rag_commit = ensure_rag_repository(
         rag_dir, revision=rag_revision
     )
+    announce_stage(workflow, "rag", f"RAG repository ready at {rag_commit[:12]}.")
     model = tokenizer = None
     try:
-        model, tokenizer, compute_dtype, history, training_metrics = _train_adapter(
-            train_dataframe,
-            spec=spec,
-            task=validated_task,
-            revision=effective_revision,
-            token=token,
-            parameters=parameters,
-        )
-        project_drive = mount_drive(drive_root)
-        adapter_target = (
-            project_drive
-            / "models"
-            / "lora"
-            / slugify_model_id(spec.model_id)
-            / validated_task
-        )
-        adapter_target.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(adapter_target, safe_serialization=True)
-        tokenizer.save_pretrained(adapter_target)
-        (adapter_target / "run_config.json").write_text(
-            json.dumps(
-                {
-                    "model_id": spec.model_id,
-                    "requested_revision": revision or "registry_default",
-                    "resolved_revision": effective_revision,
-                    "task": validated_task,
-                    "hyperparameters": parameters,
-                    "training_metrics": training_metrics,
-                    "train_sha256": train_hash,
-                    "validation_sha256": val_hash,
-                    "prompt_sha256": prompt_sha256(
-                        prompt_for_task(validated_task)
-                    ),
-                    "rag_revision": rag_commit,
-                    "reproducibility": reproducibility,
-                },
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            ),
-            encoding="utf-8",
+        if artifact_manifest is not None:
+            announce_stage(
+                workflow,
+                "load",
+                "Loading the saved LoRA adapter from Drive; training is skipped.",
+            )
+            model, tokenizer, compute_dtype = _load_saved_adapter(
+                adapter_target,
+                spec=spec,
+                revision=effective_revision,
+                token=token,
+                parameters=parameters,
+            )
+            history = artifact_manifest.get("training_history", [])
+            training_metrics = artifact_manifest.get("training_metrics", {})
+            announce_stage(workflow, "load", "Saved LoRA adapter loaded.")
+        else:
+            train_dataframe = load_dataset(train_path, validated_task)
+            announce_stage(
+                workflow,
+                "training",
+                f"Starting LoRA fine-tuning on {len(train_dataframe)} examples.",
+            )
+            model, tokenizer, compute_dtype, history, training_metrics = _train_adapter(
+                train_dataframe,
+                spec=spec,
+                task=validated_task,
+                revision=effective_revision,
+                token=token,
+                parameters=parameters,
+            )
+            adapter_target.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(adapter_target, safe_serialization=True)
+            tokenizer.save_pretrained(adapter_target)
+            (adapter_target / "run_config.json").write_text(
+                json.dumps(
+                    {
+                        "model_id": spec.model_id,
+                        "requested_revision": revision or "registry_default",
+                        "resolved_revision": effective_revision,
+                        "task": validated_task,
+                        "hyperparameters": parameters,
+                        "training_history": history,
+                        "training_metrics": training_metrics,
+                        "train_sha256": train_hash,
+                        "validation_sha256": val_hash,
+                        "prompt_sha256": current_prompt_hash,
+                        "rag_revision": rag_commit,
+                        "reproducibility": reproducibility,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            announce_stage(
+                workflow,
+                "training",
+                f"Fine-tuning finished; final adapter saved to {adapter_target}.",
+            )
+        announce_stage(
+            workflow,
+            "validation",
+            f"Starting validation on {len(val_dataframe)} examples.",
         )
         predictor = CausalPredictor(
             model,
@@ -350,11 +476,14 @@ def run(
             model_id=spec.model_id,
             task=validated_task,
         )
+        announce_stage(workflow, "validation", "Validation finished.")
+        announce_stage(workflow, "testing", "Loading the RAG retrieval index.")
         retriever = PremiseRetriever.from_rag_directory(
             rag_path,
             embedding_revision=str(parameters["embedding_revision"]),
             embedding_device=str(parameters["embedding_device"]),
         )
+        announce_stage(workflow, "testing", "RAG retrieval index loaded.")
         document_predictor = CausalPredictor(
             model,
             tokenizer,
@@ -363,8 +492,20 @@ def run(
             max_input_length=int(parameters["max_input_length"]),
             max_new_tokens=int(parameters["max_new_tokens"]),
         )
-        print("Upload one or more .docx court decisions (Cancel to skip document testing).")
+        announce_stage(
+            workflow,
+            "testing",
+            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+        )
         with uploaded_docx_files() as documents:
+            if documents:
+                announce_stage(
+                    workflow,
+                    "testing",
+                    f"Starting full RAG inference for {len(documents)} document(s).",
+                )
+            else:
+                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
             document_tables = run_document_inference(
                 documents,
                 predictor=document_predictor,
@@ -373,8 +514,11 @@ def run(
                 task=validated_task,
                 top_k=int(parameters["retrieval_top_k"]),
             )
+        if documents:
+            announce_stage(workflow, "testing", "Full document inference finished.")
         import pandas as pd
 
+        announce_stage(workflow, "results", "Writing score and review artifacts.")
         workbook = write_results_workbook(
             f"lora_{slugify_model_id(spec.model_id)}_{validated_task}",
             {
@@ -390,18 +534,27 @@ def run(
             {
                 "workflow": "lora",
                 "model_id": spec.model_id,
-                "requested_revision": revision or "registry_default",
+                "requested_revision": revision or (
+                    "saved_artifact" if artifact_manifest is not None else "registry_default"
+                ),
                 "resolved_revision": effective_revision,
                 "task": validated_task,
                 "parameters": parameters,
                 "training_metrics": training_metrics,
                 "train_sha256": train_hash,
                 "validation_sha256": val_hash,
-                "prompt_sha256": prompt_sha256(prompt_for_task(validated_task)),
+                "prompt_sha256": current_prompt_hash,
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
                 "drive_adapter_path": adapter_target,
+                "used_existing_model": artifact_manifest is not None,
+                "training_skipped": artifact_manifest is not None,
+                "artifact_hyperparameters": (
+                    artifact_manifest.get("hyperparameters")
+                    if artifact_manifest is not None
+                    else None
+                ),
                 "reproducibility": reproducibility,
                 "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },
@@ -416,6 +569,7 @@ def run(
         download_file(workbook)
         if review_package is not None:
             download_file(review_package)
+        announce_stage(workflow, "complete", "Workflow finished.")
         return evaluation.scores
     finally:
         if model is not None:

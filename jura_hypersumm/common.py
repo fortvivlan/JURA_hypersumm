@@ -152,6 +152,11 @@ def merge_parameters(
     return result
 
 
+def announce_stage(workflow: str, stage: str, message: str) -> None:
+    """Print a consistent, immediately flushed workflow progress message."""
+    print(f"[JURA][{workflow}][{stage.upper()}] {message}", flush=True)
+
+
 def configure_reproducibility(seed: int, *, deterministic: bool = True) -> None:
     """Seed all RNGs and enforce deterministic PyTorch/CUDA execution.
 
@@ -336,6 +341,66 @@ def file_sha256(path: str | Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_saved_artifact_manifest(
+    artifact_dir: str | Path,
+    *,
+    required_files: Sequence[str],
+    weight_files: Sequence[str],
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a saved model/adapter directory and return its run manifest.
+
+    Reuse is deliberately strict: incomplete or incompatible artifacts raise
+    instead of triggering an expensive, unintended training run.
+    """
+    artifact_dir = Path(artifact_dir)
+    if not artifact_dir.is_dir():
+        raise FileNotFoundError(
+            f"Previously trained artifact was requested but is absent: {artifact_dir}"
+        )
+    missing = [name for name in required_files if not (artifact_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Saved artifact at {artifact_dir} is incomplete; missing: "
+            + ", ".join(missing)
+        )
+    if not any((artifact_dir / name).is_file() for name in weight_files):
+        raise FileNotFoundError(
+            f"Saved artifact at {artifact_dir} has no supported weight file "
+            f"({', '.join(weight_files)})"
+        )
+    manifest_path = artifact_dir / "run_config.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"Cannot read saved artifact manifest: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Saved artifact manifest is not a JSON object: {manifest_path}")
+    mismatches = [
+        f"{key}: saved={manifest.get(key)!r}, requested={value!r}"
+        for key, value in expected.items()
+        if manifest.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Saved artifact at {artifact_dir} is incompatible: "
+            + "; ".join(mismatches)
+        )
+    return manifest
+
+
+def saved_artifact_revision(
+    manifest: Mapping[str, Any], artifact_dir: str | Path
+) -> str:
+    """Return the immutable base revision recorded for a saved artifact."""
+    revision = manifest.get("resolved_revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError(
+            f"Saved artifact manifest has no immutable resolved revision: {artifact_dir}"
+        )
+    return revision
 
 
 def prompt_sha256(prompt_text: str) -> str:

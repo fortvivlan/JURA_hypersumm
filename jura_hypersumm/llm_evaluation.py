@@ -18,6 +18,7 @@ from .common import (
     DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
     EvaluationTables,
+    announce_stage,
     configure_reproducibility,
     default_dataset_path,
     evaluate_predictions,
@@ -112,6 +113,8 @@ def run_llm_evaluation(
         deterministic=bool(parameters["deterministic"]),
     )
     spec = resolve_model(model_name)
+    workflow = f"ready-llm/{spec.alias}"
+    announce_stage(workflow, "setup", "Loading binary and ternary validation data.")
     binary_path = Path(val_binary_path or default_dataset_path("val", "binary"))
     ternary_path = Path(val_ternary_path or default_dataset_path("val", "ternary"))
     binary_hash = file_sha256(binary_path)
@@ -128,8 +131,15 @@ def run_llm_evaluation(
     effective_revision = resolve_huggingface_revision(
         spec.model_id, revision or spec.revision, token=token
     )
+    announce_stage(workflow, "rag", "Preparing the pinned RAG repository.")
     rag_path, rag_commit = ensure_rag_repository(
         rag_dir, revision=rag_revision
+    )
+    announce_stage(workflow, "rag", f"RAG repository ready at {rag_commit[:12]}.")
+    announce_stage(
+        workflow,
+        "load",
+        f"Loading {spec.model_id} at revision {effective_revision[:12]}.",
     )
     loaded = load_causal_model(
         spec,
@@ -139,10 +149,16 @@ def run_llm_evaluation(
         device_map=parameters["device_map"],
         precision=str(parameters["precision"]),
     )
+    announce_stage(workflow, "load", "Ready LLM loaded.")
     validation_tables: list[EvaluationTables] = []
     predictors: dict[str, CausalPredictor] = {}
     try:
         for task in ("binary", "ternary"):
+            announce_stage(
+                workflow,
+                "validation",
+                f"Starting {task} validation on {len(datasets[task])} examples.",
+            )
             tables, predictor = _validate_task(
                 datasets[task],
                 model=loaded.model,
@@ -153,18 +169,34 @@ def run_llm_evaluation(
             )
             validation_tables.append(tables)
             predictors[task] = predictor
+            announce_stage(
+                workflow, "validation", f"{task.capitalize()} validation finished."
+            )
 
+        announce_stage(workflow, "testing", "Loading the RAG retrieval index.")
         retriever = PremiseRetriever.from_rag_directory(
             rag_path,
             embedding_revision=str(parameters["embedding_revision"]),
             embedding_device=str(parameters["embedding_device"]),
         )
+        announce_stage(workflow, "testing", "RAG retrieval index loaded.")
         document_aggregates = []
         document_pairs = []
         document_errors = []
-        print("Upload one or more .docx court decisions (Cancel to skip document testing).")
+        announce_stage(
+            workflow,
+            "testing",
+            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+        )
         with uploaded_docx_files() as documents:
             for task in ("binary", "ternary"):
+                if documents:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"Starting {task} full RAG inference for "
+                        f"{len(documents)} document(s).",
+                    )
                 document_predictor = CausalPredictor(
                     loaded.model,
                     loaded.tokenizer,
@@ -184,7 +216,16 @@ def run_llm_evaluation(
                 document_aggregates.append(document_tables.aggregates)
                 document_pairs.append(document_tables.pairs)
                 document_errors.append(document_tables.errors)
+                if documents:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"{task.capitalize()} document inference finished.",
+                    )
+            if not documents:
+                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
 
+        announce_stage(workflow, "results", "Writing score and review artifacts.")
         scores = concatenate_tables([tables.scores for tables in validation_tables])
         combined_document_pairs = concatenate_tables(document_pairs)
         workbook = write_results_workbook(
@@ -231,6 +272,7 @@ def run_llm_evaluation(
         download_file(workbook)
         if review_package is not None:
             download_file(review_package)
+        announce_stage(workflow, "complete", "Workflow finished.")
         return scores
     finally:
         del predictors
