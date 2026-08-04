@@ -14,7 +14,7 @@ from .documents import (
     split_russian_sentences,
     textcheck,
 )
-from .retrieval import PremiseRetriever, citation_dict
+from .retrieval import PremiseRetriever, citation_dict, citations_json
 
 
 @dataclass(frozen=True)
@@ -141,6 +141,12 @@ def run_document_inference(
                             "retrieval_rank": record.rank,
                             "retrieval_score": record.score,
                             **citation_dict(record.citation),
+                            "detected_citations": citations_json(
+                                record.detected_citations
+                            ),
+                            "unresolved_citations": citations_json(
+                                record.unresolved_citations
+                            ),
                             "prediction": prediction.label or "invalid",
                             "raw_output": prediction.raw_output,
                         }
@@ -158,6 +164,12 @@ def run_document_inference(
                             [prediction.label for prediction in predictions], task
                         ),
                         "retrieved_premises": len(retrieved),
+                        "detected_citations": citations_json(
+                            retrieved[0].detected_citations
+                        ),
+                        "unresolved_citations": citations_json(
+                            retrieved[0].unresolved_citations
+                        ),
                         "contradiction_sources": json.dumps(
                             contradiction_sources, ensure_ascii=False
                         ),

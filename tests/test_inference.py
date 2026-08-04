@@ -11,9 +11,14 @@ from jura_hypersumm.retrieval import Citation, RetrievalRecord
 class FakeRetriever:
     def retrieve(self, hypothesis: str, *, top_k: int):
         assert top_k <= 20
+        detected = (Citation("КоАП РФ", "32.9", "1", None),)
         return [
-            RetrievalRecord("p1", "source 1", "exact", 1, None, Citation()),
-            RetrievalRecord("p2", "source 2", "exact", 2, None, Citation()),
+            RetrievalRecord(
+                "p1", "source 1", "exact", 1, None, detected[0], detected
+            ),
+            RetrievalRecord(
+                "p2", "source 2", "exact", 2, None, detected[0], detected
+            ),
         ]
 
 
@@ -65,6 +70,8 @@ def test_document_inference_preserves_contradiction_premise(
     assert contradiction["premise"] == "p2"
     assert contradiction["source"] == "source 2"
     assert len(contradiction["document_sha256"]) == 64
+    assert '"article": "32.9"' in contradiction["detected_citations"]
+    assert tables.aggregates.iloc[0]["unresolved_citations"] == "[]"
 
 
 def test_document_inference_filters_irrelevant_sentences_before_retrieval(

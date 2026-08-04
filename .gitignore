@@ -214,6 +214,7 @@ __marimo__/
 #custom
 AGENTS.md
 .legacy/
+lora_local.ipynb
 
 # JURA runtime artifacts (datasets and source CSVs remain trackable)
 /dms-rag/

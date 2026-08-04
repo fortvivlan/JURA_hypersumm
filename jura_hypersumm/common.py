@@ -35,7 +35,7 @@ DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/jura")
 DEFAULT_RESULTS_DIR = Path("/content/jura_results")
 DEFAULT_BERT_REVISION = "89deeaa197d9d146e5763ac1f5fe32bf66817126"
 DEFAULT_EMBEDDING_REVISION = DEFAULT_BERT_REVISION
-DEFAULT_RAG_REVISION = "278ec2c11fe68b003aef8a8527e0bb7eeaaeed66"
+DEFAULT_RAG_REVISION = "main"
 
 
 @dataclass(frozen=True)

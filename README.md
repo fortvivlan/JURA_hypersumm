@@ -80,7 +80,9 @@ than whichever compatible versions happen to be newest.
 The package reads `train_binary.csv`, `train_ternary.csv`, `val_binary.csv`,
 and `val_ternary.csv` directly from this clone. At inference time it clones
 `https://github.com/fortvivlan/dms-rag` to `/content/dms-rag` if needed and
-uses that repository's `codex.csv` and `faiss_index/` artifacts.
+fetches its current `main` commit on every run before using that commit's
+`codex.csv` and `faiss_index/` artifacts. A dirty local RAG checkout is rejected
+so modified or stale artifacts cannot be used silently.
 
 Create a private Colab secret named `HF_TOKEN` before using a gated Hugging
 Face model such as Llama, and accept that model's license on Hugging Face. The
@@ -273,10 +275,10 @@ When at least one document is successfully analysed, the workflow also
 downloads a ZIP prepared for human review. For every document/task it contains
 `<document>_<task>_model_predictions.xlsx` with every RAG premise/model pair and
 the columns `hypothesis`, `premise`, `article_number`, `model_prediction`,
-`expert_label`, and `expert_comment`. Article values include the codex, dotted
-article number, and part where available, for example
-`КоАП РФ Статья 18.8 Часть 3.1`. A specialist can fill the last two columns so
-the predictions can later be scored against human labels. No separate
+`expert_label`, and `expert_comment`. Article values include the code, dotted
+article number, part, and point where available, for example
+`КоАП РФ Статья 32.9 Часть 1 Пункт 2`. A specialist can fill the last two
+columns so the predictions can later be scored against human labels. No separate
 top-ranked RAG workbook is generated; all retrieved candidates remain available
 in the model workbook and in the detailed main results workbook.
 
@@ -288,7 +290,12 @@ Document inference extracts the final `ПОСТАНОВИЛ` section, splits it 
 `razdel`, removes signatures and payment-detail sentences containing `судья`,
 `реквизит`, `ре...изит`, or `квитанци`, performs deterministic citation lookup
 before a maximum of 20 FAISS matches, and preserves the premise responsible for
-every contradiction. A document without `ПОСТАНОВИЛ` is reported and skipped.
+every contradiction. Deterministic lookup accepts abbreviated and full code
+names, both `п. … ч. … ст. …` and `ст. … ч. … п. …` orders, multiple citations,
+and article lists/ranges. A cited part returns all of its points; an article-only
+reference that maps to several corpus rows falls back to FAISS. Detected and
+unresolved citations are retained in the audit sheets. A document without
+`ПОСТАНОВИЛ` is reported and skipped.
 Uploaded `.docx` files are isolated in a temporary directory and deleted after
 processing even if an error occurs.
 
@@ -301,9 +308,10 @@ LoRA workflows. Each run:
   workers with the recorded seed (42 by default);
 - enables deterministic PyTorch algorithms and deterministic cuBLAS/cuDNN,
   disables cuDNN benchmarking and TF32, and uses greedy LLM generation;
-- pins BERT and RAG embeddings to an immutable Hugging Face commit, pins
-  Ministral, Qwen, and T-lite to immutable model commits, and checks out an
-  immutable `dms-rag` commit;
+- pins BERT and RAG embeddings to an immutable Hugging Face commit and pins
+  Ministral, Qwen, and T-lite to immutable model commits;
+- fetches the latest `dms-rag/main` at run start, checks out the resolved commit
+  for the complete run, and records both requested `main` and the resolved hash;
 - resolves gated Llama to an immutable commit using `HF_TOKEN` before loading
   it;
 - records SHA-256 hashes for train/validation CSVs, uploaded documents,
@@ -323,8 +331,13 @@ scores = run(
     "llama",
     "ternary",
     revision="<40-character resolved_revision from run_metadata>",
+    rag_revision="<40-character rag_commit from run_metadata>",
 )
 ```
+
+Omit `rag_revision` (or leave it as `"main"`) for a normal run that must use the
+latest remote RAG artifacts. Passing the recorded hash intentionally disables
+that update for an exact rerun.
 
 Bitwise equality is not guaranteed across different GPU architectures or CUDA
 drivers because their floating-point kernels differ. Under strict mode, an

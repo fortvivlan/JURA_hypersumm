@@ -85,25 +85,33 @@ def _article_reference(
     article_match = re.search(
         r"(?i)\bСтатья\s+([0-9]+(?:\.[0-9]+)*)", source_text
     )
+    point = ""
     if article_match:
         code = source_text[: article_match.start()].strip().rstrip(":.;").strip()
         article = article_match.group(1)
         remainder = source_text[article_match.end() :]
         part_match = re.search(
-            r"(?i)(?:\bп\.|\bч\.|\bчасть|\bпункт)\s*"
-            r"([0-9]+(?:[.-][0-9]+)*)",
+            r"(?i)(?:\bч\.|\bчасть)\s*([0-9]+(?:\.[0-9]+)*)",
             remainder,
         )
         part = part_match.group(1) if part_match else ""
+        point_match = re.search(
+            r"(?i)(?:\bп\.|\bпункт)\s*([0-9]+(?:\.[0-9]+)*)",
+            remainder,
+        )
+        point = point_match.group(1) if point_match else ""
     else:
         code = _metadata_text(citation_code)
         article = _metadata_text(citation_article)
-        part = _metadata_text(citation_point) or _metadata_text(citation_part)
+        part = _metadata_text(citation_part)
+        point = _metadata_text(citation_point)
     if not article:
         return ""
     components = [code, f"Статья {article}"] if code else [f"Статья {article}"]
     if part:
         components.append(f"Часть {part}")
+    if point:
+        components.append(f"Пункт {point}")
     return " ".join(components)
 
 

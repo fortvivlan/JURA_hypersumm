@@ -43,10 +43,10 @@ def test_stage_message_is_consistent_and_flushed(capsys) -> None:
     )
 
 
-def test_pinned_revisions_are_immutable_hashes() -> None:
+def test_model_revisions_are_pinned_and_rag_tracks_main() -> None:
     assert DEFAULT_BERT_REVISION == DEFAULT_EMBEDDING_REVISION
     assert re.fullmatch(r"[0-9a-f]{40}", DEFAULT_BERT_REVISION)
-    assert re.fullmatch(r"[0-9a-f]{40}", DEFAULT_RAG_REVISION)
+    assert DEFAULT_RAG_REVISION == "main"
     for spec in MODEL_SPECS:
         if spec.alias != "llama":
             assert spec.revision is not None

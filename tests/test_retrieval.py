@@ -3,11 +3,15 @@ from pathlib import Path
 import subprocess
 
 import pandas as pd
+import pytest
 
 from jura_hypersumm.retrieval import (
+    Citation,
     PremiseRetriever,
     ensure_rag_repository,
     extract_citation,
+    extract_citations,
+    parse_codex_source,
 )
 
 
@@ -32,12 +36,29 @@ class FakeVectorStore:
 def _retriever() -> tuple[PremiseRetriever, FakeVectorStore]:
     codex = pd.DataFrame(
         {
-            "text": ["a", "b", "c", "d"],
+            "text": [
+                "5.35/1",
+                "5.35.1/1",
+                "18.8/3",
+                "18.8/3.1",
+                "32.9/1/1",
+                "32.9/1/2",
+                "29.9",
+                "29.10",
+                "29.11",
+                "instruction",
+            ],
             "source": [
-                "КоАП РФ: Статья 5.35. п. 1. ",
-                "КоАП РФ: Статья 5.35.1. п. 1. ",
-                "КоАП РФ: Статья 18.8. п. 3. ",
-                "КоАП РФ: Статья 18.8. п. 3.1.",
+                "КоАП РФ: Статья 5.35. ч. 1 п. 1.",
+                "КоАП РФ: Статья 5.35.1. ч. 1 п. 1.",
+                "КоАП РФ: Статья 18.8. ч. 3.",
+                "КоАП РФ: Статья 18.8. ч. 3.1.",
+                "КоАП РФ: Статья 32.9. ч. 1 п. 1.",
+                "КоАП РФ: Статья 32.9. ч. 1 п. 2.",
+                "КоАП РФ: Статья 29.9.",
+                "КоАП РФ: Статья 29.10.",
+                "КоАП РФ: Статья 29.11.",
+                "Инструкция ОС: Статья 7. ч. 2.",
             ],
         }
     )
@@ -55,13 +76,83 @@ def test_extract_citation_preserves_dotted_numbers_and_long_code_name() -> None:
     assert citation.code == "КоАП РФ"
 
 
+def test_extract_citations_supports_both_orders_and_full_words() -> None:
+    assert extract_citations("п. 2 ч. 1 ст. 32.9 КоАП РФ") == [
+        Citation("КоАП РФ", "32.9", "1", "2")
+    ]
+    assert extract_citations("ст. 32.9 ч. 1 п. 2 КоАП РФ") == [
+        Citation("КоАП РФ", "32.9", "1", "2")
+    ]
+    assert extract_citations("ст. 27.19.1 ч 1 КоАП РФ") == [
+        Citation("КоАП РФ", "27.19.1", "1", None)
+    ]
+    assert extract_citations(
+        "Частью 3 статьи 18.8 Кодекса Российской Федерации "
+        "об административных правонарушениях"
+    ) == [Citation("КоАП РФ", "18.8", "3", None)]
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("ст. 1225 Гражданского кодекса Российской Федерации", "ГК РФ"),
+        ("ст. 1 Гражданского процессуального кодекса РФ", "ГПК РФ"),
+        ("ст. 1 Кодекса административного судопроизводства РФ", "КАС РФ"),
+        ("ст. 1 Трудового кодекса Российской Федерации", "ТК"),
+        ("ст. 1 Уголовно-исполнительного кодекса РФ", "УИК РФ"),
+        ("ст. 1 Уголовного кодекса РФ", "УК РФ"),
+        ("ст. 1 Уголовно-процессуального кодекса РФ", "УПК РФ"),
+    ],
+)
+def test_extract_citations_recognizes_full_names_for_corpus_codes(
+    text: str, code: str
+) -> None:
+    assert extract_citations(text)[0].code == code
+
+
+def test_extract_citations_keeps_codes_local_to_each_article() -> None:
+    citations = extract_citations(
+        "ч. 2 ст. 5 Федерального закона № 115-ФЗ, то есть "
+        "ч. 3.1 ст. 18.8 КоАП РФ"
+    )
+    assert citations == [
+        Citation(None, "5", "2", None),
+        Citation("КоАП РФ", "18.8", "3.1", None),
+    ]
+
+
+def test_extract_citations_expands_lists_and_same_prefix_ranges() -> None:
+    citations = extract_citations(
+        "руководствуясь ст.ст. 3.5, 29.9-29.11 КоАП РФ"
+    )
+    assert [citation.article for citation in citations] == [
+        "3.5",
+        "29.9",
+        "29.10",
+        "29.11",
+    ]
+    assert {citation.code for citation in citations} == {"КоАП РФ"}
+
+
+def test_parse_updated_codex_source_hierarchy() -> None:
+    assert parse_codex_source("КоАП РФ: Статья 32.9. ч. 1 п. 2.") == Citation(
+        "КоАП РФ", "32.9", "1", "2"
+    )
+    assert parse_codex_source("ТК: Статья 58. п. 1.") == Citation(
+        "ТК", "58", None, "1"
+    )
+    assert parse_codex_source("ГК РФ ч.4: Статья 1225. ч. 1 п. 1.") == Citation(
+        "ГК РФ ч.4", "1225", "1", "1"
+    )
+
+
 def test_exact_lookup_does_not_confuse_dotted_article_prefixes() -> None:
     retriever, vectorstore = _retriever()
 
-    records = retriever.retrieve("п. 1 ст. 5.35 КоАП РФ")
+    records = retriever.retrieve("п. 1 ч. 1 ст. 5.35 КоАП РФ")
 
     assert [record.source for record in records] == [
-        "КоАП РФ: Статья 5.35. п. 1. "
+        "КоАП РФ: Статья 5.35. ч. 1 п. 1."
     ]
     assert records[0].method == "exact"
     assert vectorstore.calls == []
@@ -71,7 +162,44 @@ def test_exact_lookup_distinguishes_point_3_from_3_1() -> None:
     retriever, _ = _retriever()
     records = retriever.retrieve("ч. 3.1 ст. 18.8 КоАП РФ")
     assert len(records) == 1
-    assert "п. 3.1." in records[0].source
+    assert "ч. 3.1." in records[0].source
+
+
+def test_part_lookup_returns_all_points_and_point_lookup_returns_one() -> None:
+    retriever, vectorstore = _retriever()
+
+    part_records = retriever.retrieve("ст. 32.9 ч. 1 КоАП РФ")
+    point_records = retriever.retrieve("п. 2 ч. 1 ст. 32.9 КоАП РФ")
+
+    assert [record.source for record in part_records] == [
+        "КоАП РФ: Статья 32.9. ч. 1 п. 1.",
+        "КоАП РФ: Статья 32.9. ч. 1 п. 2.",
+    ]
+    assert [record.premise for record in point_records] == ["32.9/1/2"]
+    assert vectorstore.calls == []
+
+
+def test_multiple_and_partially_resolved_citations_do_not_mix_in_faiss() -> None:
+    retriever, vectorstore = _retriever()
+
+    records = retriever.retrieve(
+        "ст. 29.9 КоАП РФ и ч. 1 ст. 999 КоАП РФ"
+    )
+
+    assert [record.premise for record in records] == ["29.9"]
+    assert records[0].unresolved_citations == (
+        Citation("КоАП РФ", "999", "1", None),
+    )
+    assert vectorstore.calls == []
+
+
+def test_literal_code_aliases_are_derived_from_codex() -> None:
+    retriever, vectorstore = _retriever()
+
+    records = retriever.retrieve("ст. 7 ч. 2 Инструкция ОС")
+
+    assert [record.premise for record in records] == ["instruction"]
+    assert vectorstore.calls == []
 
 
 def test_ambiguous_citation_falls_back_to_at_most_twenty() -> None:
@@ -82,6 +210,60 @@ def test_ambiguous_citation_falls_back_to_at_most_twenty() -> None:
     assert len(records) == 20
     assert all(record.method == "faiss" for record in records)
     assert vectorstore.calls == [("ст. 18.8 КоАП РФ", 20)]
+
+
+def _write_rag_artifacts(repository: Path, marker: str) -> None:
+    (repository / "faiss_index").mkdir(exist_ok=True)
+    (repository / "faiss_index" / "index.faiss").write_bytes(b"index")
+    (repository / "faiss_index" / "index.pkl").write_bytes(b"metadata")
+    (repository / "codex.csv").write_text(
+        f"text,source\n{marker},s\n", encoding="utf-8"
+    )
+
+
+def _commit(repository: Path, message: str) -> str:
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", message],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_rag_main_is_refetched_on_every_run(tmp_path: Path) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(origin), "config", "user.name", "Test"], check=True
+    )
+    _write_rag_artifacts(origin, "first")
+    first = _commit(origin, "first")
+    checkout = tmp_path / "checkout"
+
+    _, first_resolved = ensure_rag_repository(
+        checkout, repository_url=str(origin), revision="main"
+    )
+    _write_rag_artifacts(origin, "second")
+    second = _commit(origin, "second")
+    _, second_resolved = ensure_rag_repository(
+        checkout, repository_url=str(origin), revision="main"
+    )
+
+    assert first_resolved == first
+    assert second_resolved == second
+    assert (checkout / "codex.csv").read_text(encoding="utf-8") == (
+        "text,source\nsecond,s\n"
+    )
 
 
 def test_rag_repository_is_checked_out_at_requested_commit(tmp_path: Path) -> None:
@@ -122,3 +304,25 @@ def test_rag_repository_is_checked_out_at_requested_commit(tmp_path: Path) -> No
 
     assert path == repository
     assert resolved == pinned
+
+
+def test_dirty_rag_repository_is_rejected(tmp_path: Path) -> None:
+    repository = tmp_path / "rag"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Test"],
+        check=True,
+    )
+    _write_rag_artifacts(repository, "committed")
+    pinned = _commit(repository, "artifacts")
+    (repository / "codex.csv").write_text(
+        "text,source\nmodified,s\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="local changes"):
+        ensure_rag_repository(repository, revision=pinned)

@@ -257,6 +257,7 @@ def run_llm_evaluation(
                 "ternary_validation_sha256": ternary_hash,
                 "binary_prompt_sha256": prompt_sha256(prompt_for_task("binary")),
                 "ternary_prompt_sha256": prompt_sha256(prompt_for_task("ternary")),
+                "rag_requested_revision": rag_revision,
                 "rag_commit": rag_commit,
                 "compute_dtype": loaded.compute_dtype,
                 "summary_enabled": False,
