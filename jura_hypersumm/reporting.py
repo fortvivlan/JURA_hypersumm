@@ -73,14 +73,14 @@ def _metadata_text(value: object) -> str:
     return str(value).strip()
 
 
-def _article_reference(
+def format_article_reference(
     source: object,
     citation_code: object = None,
     citation_article: object = None,
     citation_part: object = None,
     citation_point: object = None,
 ) -> str:
-    """Format a retrieved codex source like a train/validation source label."""
+    """Format a retrieved codex source like a review-workbook article label."""
     source_text = _metadata_text(source)
     article_match = re.search(
         r"(?i)\bСтатья\s+([0-9]+(?:\.[0-9]+)*)", source_text
@@ -113,6 +113,10 @@ def _article_reference(
     if point:
         components.append(f"Пункт {point}")
     return " ".join(components)
+
+
+# Kept for compatibility with older internal imports and tests.
+_article_reference = format_article_reference
 
 
 def write_document_review_package(
@@ -153,11 +157,28 @@ def write_document_review_package(
         prefix="jura_review_", dir=output_dir
     ) as temporary_directory:
         temporary = Path(temporary_directory)
+        dataset_aware = "test_dataset" in document_pairs.columns and any(
+            str(value) != "default"
+            for value in document_pairs["test_dataset"].dropna().unique()
+        )
+        grouping = ["document"]
+        sort_columns = ["document", "task", "sentence_index", "retrieval_rank"]
+        if dataset_aware:
+            grouping.insert(0, "test_dataset")
+            sort_columns.insert(0, "test_dataset")
         ordered = document_pairs.sort_values(
-            ["document", "task", "sentence_index", "retrieval_rank"],
+            sort_columns,
             kind="stable",
         )
-        for document_name, document_rows in ordered.groupby("document", sort=False):
+        grouped = ordered.groupby(grouping, sort=False)
+        for group_key, document_rows in grouped:
+            if dataset_aware:
+                dataset_name, document_name = group_key
+                dataset_directory = temporary / _safe_artifact_name(str(dataset_name))
+                dataset_directory.mkdir(parents=True, exist_ok=True)
+            else:
+                document_name = group_key[0] if isinstance(group_key, tuple) else group_key
+                dataset_directory = temporary
             document_slug = _safe_artifact_name(Path(str(document_name)).stem)
             for task, task_rows in document_rows.groupby("task", sort=False):
                 model_review = task_rows.loc[
@@ -167,7 +188,7 @@ def write_document_review_package(
                     2,
                     "article_number",
                     [
-                        _article_reference(
+                        format_article_reference(
                             row.source,
                             getattr(row, "citation_code", None),
                             getattr(row, "citation_article", None),
@@ -179,7 +200,7 @@ def write_document_review_package(
                 )
                 model_review["expert_label"] = ""
                 model_review["expert_comment"] = ""
-                model_path = temporary / (
+                model_path = dataset_directory / (
                     f"{document_slug}_{_safe_artifact_name(str(task))}_model_predictions.xlsx"
                 )
                 model_review.to_excel(
@@ -187,6 +208,6 @@ def write_document_review_package(
                 )
 
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for workbook in sorted(temporary.glob("*.xlsx")):
-                archive.write(workbook, arcname=workbook.name)
+            for workbook in sorted(temporary.rglob("*.xlsx")):
+                archive.write(workbook, arcname=workbook.relative_to(temporary))
     return archive_path

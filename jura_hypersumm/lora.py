@@ -13,12 +13,19 @@ from .colab_support import (
     prepare_artifact_root,
     selected_docx_files,
 )
+from .autotest_scoring import (
+    add_test_dataset,
+    discover_autotest_datasets,
+    score_autotest_predictions,
+)
 from .common import (
+    DEFAULT_AUTOTEST_DIR,
     DEFAULT_DRIVE_ROOT,
     DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
     DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
+    DEFAULT_TEST_DOCX_DIR,
     Task,
     announce_stage,
     configure_reproducibility,
@@ -325,6 +332,10 @@ def run(
     revision: str | None = None,
     use_existing_model: bool = False,
     document_paths: Sequence[str | Path] | None = None,
+    autotest_dir: str | Path = DEFAULT_AUTOTEST_DIR,
+    test_docx_dir: str | Path = DEFAULT_TEST_DOCX_DIR,
+    score_autotest: bool = True,
+    multiple_test: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
     """Train or reuse, validate, and document-test one task LoRA adapter.
@@ -332,10 +343,11 @@ def run(
     ``hyperparameters`` may override any key in
     :data:`DEFAULT_LORA_HYPERPARAMETERS`; unknown keys are rejected.
     With ``use_existing_model=True``, the compatible final adapter in artifact
-    storage is required and training is skipped. Outside Colab, pass explicit
-    local ``drive_root``, ``rag_dir``, ``results_dir``, and ``document_paths``.
-    The function returns the main validation score table and downloads a
-    detailed XLSX workbook.
+    storage is required and training is skipped. With no explicit
+    ``document_paths``, the matched repository benchmark DOCX files are used.
+    Set ``score_autotest=False`` to disable benchmark scoring, or
+    ``multiple_test=True`` to evaluate paired child folders separately. The
+    function returns the combined validation and autotest score table.
     """
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
@@ -531,39 +543,135 @@ def run(
             "testing",
             "Document testing is ready. Select or provide DOCX files, or skip it.",
         )
-        with selected_docx_files(document_paths) as documents:
+        import pandas as pd
+
+        if document_paths is None:
+            datasets = discover_autotest_datasets(
+                autotest_dir, test_docx_dir, multiple_test=multiple_test
+            )
+            dataset_inputs = [
+                (
+                    dataset.name,
+                    dataset.autotest_dir,
+                    dataset.docx_dir,
+                    dataset.documents,
+                )
+                for dataset in datasets
+            ]
+        else:
+            dataset_inputs = [
+                ("default", Path(autotest_dir), Path(test_docx_dir), document_paths)
+            ]
+
+        inference_runs = []
+        for dataset_name, review_dir, document_dir, paths in dataset_inputs:
+            with selected_docx_files(paths) as documents:
+                if documents:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"Starting {dataset_name} full RAG inference for "
+                        f"{len(documents)} document(s).",
+                    )
+                else:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"No DOCX files selected for {dataset_name}; testing skipped.",
+                    )
+                tables = run_document_inference(
+                    documents,
+                    predictor=document_predictor,
+                    retriever=retriever,
+                    model_id=spec.model_id,
+                    task=validated_task,
+                    top_k=int(parameters["retrieval_top_k"]),
+                )
+            inference_runs.append(
+                (
+                    dataset_name,
+                    review_dir,
+                    document_dir,
+                    tuple(documents),
+                    add_test_dataset(tables.aggregates, dataset_name),
+                    add_test_dataset(tables.pairs, dataset_name),
+                    add_test_dataset(tables.errors, dataset_name),
+                )
+            )
             if documents:
                 announce_stage(
                     workflow,
                     "testing",
-                    f"Starting full RAG inference for {len(documents)} document(s).",
+                    f"{dataset_name} full document inference finished.",
                 )
-            else:
-                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
-            document_tables = run_document_inference(
-                documents,
-                predictor=document_predictor,
-                retriever=retriever,
-                model_id=spec.model_id,
-                task=validated_task,
-                top_k=int(parameters["retrieval_top_k"]),
+
+        document_aggregates = pd.concat(
+            [run[4] for run in inference_runs], ignore_index=True
+        )
+        document_pairs = pd.concat([run[5] for run in inference_runs], ignore_index=True)
+        document_errors = pd.concat([run[6] for run in inference_runs], ignore_index=True)
+        autotest_tables = []
+        if score_autotest:
+            announce_stage(
+                workflow, "scoring", "Scoring fresh document pairs against autotest."
             )
-        if documents:
-            announce_stage(workflow, "testing", "Full document inference finished.")
-        import pandas as pd
+            for dataset_name, review_dir, document_dir, documents, _, pairs, _ in inference_runs:
+                if not documents:
+                    continue
+                autotest_tables.append(
+                    score_autotest_predictions(
+                        pairs,
+                        documents,
+                        model_id=spec.model_id,
+                        task=validated_task,
+                        autotest_dir=review_dir,
+                        docx_dir=document_dir,
+                        test_dataset=dataset_name,
+                    )
+                )
+        combined_scores = pd.concat(
+            [evaluation.scores]
+            + [tables.scores for tables in autotest_tables],
+            ignore_index=True,
+        )
+        combined_per_class = pd.concat(
+            [evaluation.per_class]
+            + [tables.per_class for tables in autotest_tables],
+            ignore_index=True,
+        )
+        combined_confusion = pd.concat(
+            [evaluation.confusion_matrix]
+            + [tables.confusion_matrix for tables in autotest_tables],
+            ignore_index=True,
+        )
 
         announce_stage(workflow, "results", "Writing score and review artifacts.")
         workbook = write_results_workbook(
             f"lora_{slugify_model_id(spec.model_id)}_{validated_task}",
             {
-                "scores": evaluation.scores,
-                "per_class": evaluation.per_class,
-                "confusion_matrix": evaluation.confusion_matrix,
+                "scores": combined_scores,
+                "per_class": combined_per_class,
+                "confusion_matrix": combined_confusion,
                 "validation_predictions": evaluation.predictions,
                 "training_history": pd.DataFrame(history),
-                "document_aggregates": document_tables.aggregates,
-                "document_pairs": document_tables.pairs,
-                "errors": document_tables.errors,
+                "document_aggregates": document_aggregates,
+                "document_pairs": document_pairs,
+                "errors": document_errors,
+                "rag_summary": pd.concat(
+                    [tables.rag_summary for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "autotest_alignment": pd.concat(
+                    [tables.alignment for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "inferred_gold": pd.concat(
+                    [tables.inferred_gold for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "autotest_excluded": pd.concat(
+                    [tables.excluded for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "file_matching": pd.concat(
+                    [tables.file_matching for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
             },
             {
                 "workflow": "lora",
@@ -583,6 +691,11 @@ def run(
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
+                "autotest_enabled": score_autotest,
+                "multiple_test": multiple_test,
+                "test_datasets": [run[0] for run in inference_runs],
+                "autotest_dir": Path(autotest_dir),
+                "test_docx_dir": Path(test_docx_dir),
                 "drive_adapter_path": adapter_target,
                 "artifact_path": adapter_target,
                 "used_existing_model": artifact_manifest is not None,
@@ -599,15 +712,15 @@ def run(
         )
         review_package = write_document_review_package(
             f"lora_{slugify_model_id(spec.model_id)}_{validated_task}",
-            document_tables.pairs,
+            document_pairs,
             output_dir=results_dir,
         )
-        display_scores(evaluation.scores)
+        display_scores(combined_scores)
         deliver_file(workbook)
         if review_package is not None:
             deliver_file(review_package)
         announce_stage(workflow, "complete", "Workflow finished.")
-        return evaluation.scores
+        return combined_scores
     finally:
         if model is not None:
             del model

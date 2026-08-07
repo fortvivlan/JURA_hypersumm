@@ -112,3 +112,35 @@ def test_document_review_package_is_skipped_without_pairs(tmp_path: Path) -> Non
         )
         is None
     )
+
+
+def test_document_review_package_separates_multi_dataset_duplicate_names(
+    tmp_path: Path,
+) -> None:
+    pairs = pd.DataFrame(
+        [
+            {
+                "test_dataset": dataset_name,
+                "document": "decision.docx",
+                "task": "ternary",
+                "sentence_index": 0,
+                "hypothesis": "Sentence.",
+                "premise": f"{dataset_name} premise",
+                "source": "КоАП РФ: Статья 1.",
+                "retrieval_rank": 1,
+                "prediction": "not mentioned",
+            }
+            for dataset_name in ("Dialogue", "Full")
+        ]
+    )
+
+    archive_path = write_document_review_package(
+        "multi", pairs, output_dir=tmp_path
+    )
+
+    assert archive_path is not None
+    with ZipFile(archive_path) as archive:
+        assert set(archive.namelist()) == {
+            "Dialogue/decision_ternary_model_predictions.xlsx",
+            "Full/decision_ternary_model_predictions.xlsx",
+        }

@@ -13,15 +13,22 @@ from .colab_support import (
     get_huggingface_token,
     mount_drive,
     require_colab,
-    uploaded_docx_files,
+    selected_docx_files,
+)
+from .autotest_scoring import (
+    add_test_dataset,
+    discover_autotest_datasets,
+    score_autotest_predictions,
 )
 from .common import (
+    DEFAULT_AUTOTEST_DIR,
     DEFAULT_BERT_REVISION,
     DEFAULT_DRIVE_ROOT,
     DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
     DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
+    DEFAULT_TEST_DOCX_DIR,
     LABEL2ID_BY_TASK,
     Task,
     announce_stage,
@@ -342,6 +349,11 @@ def _run_bert(
     revision: str | None,
     use_existing_model: bool,
     hyperparameters: Mapping[str, Any] | None,
+    document_paths: Sequence[str | Path] | None,
+    autotest_dir: str | Path,
+    test_docx_dir: str | Path,
+    score_autotest: bool,
+    multiple_test: bool,
     results_dir: str | Path,
 ):
     require_colab()
@@ -503,39 +515,136 @@ def _run_bert(
         announce_stage(
             workflow,
             "testing",
-            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+            "Document testing is ready. Preparing benchmark or explicit DOCX files.",
         )
-        with uploaded_docx_files() as documents:
+        import pandas as pd
+
+        if document_paths is None:
+            datasets = discover_autotest_datasets(
+                autotest_dir, test_docx_dir, multiple_test=multiple_test
+            )
+            dataset_inputs = [
+                (
+                    dataset.name,
+                    dataset.autotest_dir,
+                    dataset.docx_dir,
+                    dataset.documents,
+                )
+                for dataset in datasets
+            ]
+        else:
+            dataset_inputs = [
+                ("default", Path(autotest_dir), Path(test_docx_dir), document_paths)
+            ]
+
+        inference_runs = []
+        for dataset_name, review_dir, document_dir, paths in dataset_inputs:
+            with selected_docx_files(paths) as documents:
+                if documents:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"Starting {dataset_name} full RAG inference for "
+                        f"{len(documents)} document(s).",
+                    )
+                else:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"No DOCX files selected for {dataset_name}; testing skipped.",
+                    )
+                tables = run_document_inference(
+                    documents,
+                    predictor=predictor,
+                    retriever=retriever,
+                    model_id=model_id,
+                    task=task,
+                    top_k=int(parameters["retrieval_top_k"]),
+                )
+            inference_runs.append(
+                (
+                    dataset_name,
+                    review_dir,
+                    document_dir,
+                    tuple(documents),
+                    add_test_dataset(tables.aggregates, dataset_name),
+                    add_test_dataset(tables.pairs, dataset_name),
+                    add_test_dataset(tables.errors, dataset_name),
+                )
+            )
             if documents:
                 announce_stage(
                     workflow,
                     "testing",
-                    f"Starting full RAG inference for {len(documents)} document(s).",
+                    f"{dataset_name} full document inference finished.",
                 )
-            else:
-                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
-            document_tables = run_document_inference(
-                documents,
-                predictor=predictor,
-                retriever=retriever,
-                model_id=model_id,
-                task=task,
-                top_k=int(parameters["retrieval_top_k"]),
+
+        document_aggregates = pd.concat(
+            [run[4] for run in inference_runs], ignore_index=True
+        )
+        document_pairs = pd.concat([run[5] for run in inference_runs], ignore_index=True)
+        document_errors = pd.concat([run[6] for run in inference_runs], ignore_index=True)
+        autotest_tables = []
+        if score_autotest:
+            announce_stage(
+                workflow, "scoring", "Scoring fresh document pairs against autotest."
             )
-        if documents:
-            announce_stage(workflow, "testing", "Full document inference finished.")
+            for dataset_name, review_dir, document_dir, documents, _, pairs, _ in inference_runs:
+                if not documents:
+                    continue
+                autotest_tables.append(
+                    score_autotest_predictions(
+                        pairs,
+                        documents,
+                        model_id=model_id,
+                        task=task,
+                        autotest_dir=review_dir,
+                        docx_dir=document_dir,
+                        test_dataset=dataset_name,
+                    )
+                )
+        combined_scores = pd.concat(
+            [evaluation.scores]
+            + [tables.scores for tables in autotest_tables],
+            ignore_index=True,
+        )
+        combined_per_class = pd.concat(
+            [evaluation.per_class]
+            + [tables.per_class for tables in autotest_tables],
+            ignore_index=True,
+        )
+        combined_confusion = pd.concat(
+            [evaluation.confusion_matrix]
+            + [tables.confusion_matrix for tables in autotest_tables],
+            ignore_index=True,
+        )
         announce_stage(workflow, "results", "Writing score and review artifacts.")
         workbook = write_results_workbook(
             f"bert_{task}",
             {
-                "scores": evaluation.scores,
-                "per_class": evaluation.per_class,
-                "confusion_matrix": evaluation.confusion_matrix,
+                "scores": combined_scores,
+                "per_class": combined_per_class,
+                "confusion_matrix": combined_confusion,
                 "validation_predictions": evaluation.predictions,
-                "training_history": __import__("pandas").DataFrame(history),
-                "document_aggregates": document_tables.aggregates,
-                "document_pairs": document_tables.pairs,
-                "errors": document_tables.errors,
+                "training_history": pd.DataFrame(history),
+                "document_aggregates": document_aggregates,
+                "document_pairs": document_pairs,
+                "errors": document_errors,
+                "rag_summary": pd.concat(
+                    [tables.rag_summary for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "autotest_alignment": pd.concat(
+                    [tables.alignment for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "inferred_gold": pd.concat(
+                    [tables.inferred_gold for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "autotest_excluded": pd.concat(
+                    [tables.excluded for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
+                "file_matching": pd.concat(
+                    [tables.file_matching for tables in autotest_tables], ignore_index=True
+                ) if autotest_tables else None,
             },
             {
                 "workflow": "bert",
@@ -552,6 +661,11 @@ def _run_bert(
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,
                 "summary_enabled": False,
+                "autotest_enabled": score_autotest,
+                "multiple_test": multiple_test,
+                "test_datasets": [run[0] for run in inference_runs],
+                "autotest_dir": Path(autotest_dir),
+                "test_docx_dir": Path(test_docx_dir),
                 "drive_model_path": model_target,
                 "used_existing_model": artifact_manifest is not None,
                 "training_skipped": artifact_manifest is not None,
@@ -567,15 +681,15 @@ def _run_bert(
         )
         review_package = write_document_review_package(
             f"bert_{task}",
-            document_tables.pairs,
+            document_pairs,
             output_dir=results_dir,
         )
-        display_scores(evaluation.scores)
+        display_scores(combined_scores)
         download_file(workbook)
         if review_package is not None:
             download_file(review_package)
         announce_stage(workflow, "complete", "Workflow finished.")
-        return evaluation.scores
+        return combined_scores
     finally:
         if model is not None:
             del model
@@ -601,12 +715,18 @@ def run_bert_binary(
     revision: str | None = None,
     use_existing_model: bool = False,
     hyperparameters: Mapping[str, Any] | None = None,
+    document_paths: Sequence[str | Path] | None = None,
+    autotest_dir: str | Path = DEFAULT_AUTOTEST_DIR,
+    test_docx_dir: str | Path = DEFAULT_TEST_DOCX_DIR,
+    score_autotest: bool = True,
+    multiple_test: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
     """Train or reuse, validate, and document-test the binary BERT baseline.
 
     ``use_existing_model=True`` requires a compatible final model in Drive and
-    skips training completely.
+    skips training completely. ``multiple_test=True`` evaluates paired child
+    folders below the autotest and DOCX roots as separate datasets.
     """
     return _run_bert(
         "binary",
@@ -619,6 +739,11 @@ def run_bert_binary(
         revision=revision,
         use_existing_model=use_existing_model,
         hyperparameters=hyperparameters,
+        document_paths=document_paths,
+        autotest_dir=autotest_dir,
+        test_docx_dir=test_docx_dir,
+        score_autotest=score_autotest,
+        multiple_test=multiple_test,
         results_dir=results_dir,
     )
 
@@ -634,12 +759,18 @@ def run_bert_ternary(
     revision: str | None = None,
     use_existing_model: bool = False,
     hyperparameters: Mapping[str, Any] | None = None,
+    document_paths: Sequence[str | Path] | None = None,
+    autotest_dir: str | Path = DEFAULT_AUTOTEST_DIR,
+    test_docx_dir: str | Path = DEFAULT_TEST_DOCX_DIR,
+    score_autotest: bool = True,
+    multiple_test: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
     """Train or reuse, validate, and document-test the ternary BERT baseline.
 
     ``use_existing_model=True`` requires a compatible final model in Drive and
-    skips training completely.
+    skips training completely. ``multiple_test=True`` evaluates paired child
+    folders below the autotest and DOCX roots as separate datasets.
     """
     return _run_bert(
         "ternary",
@@ -652,5 +783,10 @@ def run_bert_ternary(
         revision=revision,
         use_existing_model=use_existing_model,
         hyperparameters=hyperparameters,
+        document_paths=document_paths,
+        autotest_dir=autotest_dir,
+        test_docx_dir=test_docx_dir,
+        score_autotest=score_autotest,
+        multiple_test=multiple_test,
         results_dir=results_dir,
     )

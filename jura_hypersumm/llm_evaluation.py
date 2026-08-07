@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .colab_support import (
     download_file,
     get_huggingface_token,
     require_colab,
-    uploaded_docx_files,
+    selected_docx_files,
+)
+from .autotest_scoring import (
+    add_test_dataset,
+    discover_autotest_datasets,
+    score_autotest_predictions,
 )
 from .common import (
+    DEFAULT_AUTOTEST_DIR,
     DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_DIR,
     DEFAULT_RAG_REVISION,
     DEFAULT_RESULTS_DIR,
+    DEFAULT_TEST_DOCX_DIR,
     EvaluationTables,
     announce_stage,
     configure_reproducibility,
@@ -100,13 +107,18 @@ def run_llm_evaluation(
     rag_revision: str = DEFAULT_RAG_REVISION,
     revision: str | None = None,
     inference_parameters: Mapping[str, Any] | None = None,
+    document_paths: Sequence[str | Path] | None = None,
+    autotest_dir: str | Path = DEFAULT_AUTOTEST_DIR,
+    test_docx_dir: str | Path = DEFAULT_TEST_DOCX_DIR,
+    score_autotest: bool = True,
+    multiple_test: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
 ):
-    """Validate one supported ready LLM on both tasks and test uploaded DOCX files.
+    """Validate one ready LLM and run both tasks on benchmark DOCX files.
 
-    The function is intended for Google Colab. It returns the main score table
-    and downloads a detailed XLSX workbook containing validation and document
-    inference audit tables.
+    With no explicit ``document_paths``, all matched repository benchmark files
+    are used. ``multiple_test=True`` evaluates paired child folders separately.
+    The returned table combines validation and autotest scores.
     """
     require_colab()
     parameters = merge_parameters(DEFAULT_INFERENCE_PARAMETERS, inference_parameters)
@@ -182,63 +194,126 @@ def run_llm_evaluation(
             embedding_device=str(parameters["embedding_device"]),
         )
         announce_stage(workflow, "testing", "RAG retrieval index loaded.")
-        document_aggregates = []
-        document_pairs = []
-        document_errors = []
         announce_stage(
             workflow,
             "testing",
-            "Document testing is ready. Upload one or more DOCX files, or cancel to skip.",
+            "Document testing is ready. Preparing benchmark or explicit DOCX files.",
         )
-        with uploaded_docx_files() as documents:
-            for task in ("binary", "ternary"):
-                if documents:
-                    announce_stage(
-                        workflow,
-                        "testing",
-                        f"Starting {task} full RAG inference for "
-                        f"{len(documents)} document(s).",
-                    )
-                document_predictor = CausalPredictor(
-                    loaded.model,
-                    loaded.tokenizer,
-                    task,
-                    batch_size=int(parameters["document_batch_size"]),
-                    max_input_length=int(parameters["max_input_length"]),
-                    max_new_tokens=int(parameters["max_new_tokens"]),
+        document_aggregates = []
+        document_pairs = []
+        document_errors = []
+        if document_paths is None:
+            datasets = discover_autotest_datasets(
+                autotest_dir, test_docx_dir, multiple_test=multiple_test
+            )
+            dataset_inputs = [
+                (
+                    dataset.name,
+                    dataset.autotest_dir,
+                    dataset.docx_dir,
+                    dataset.documents,
                 )
-                document_tables = run_document_inference(
-                    documents,
-                    predictor=document_predictor,
-                    retriever=retriever,
-                    model_id=spec.model_id,
-                    task=task,
-                    top_k=int(parameters["retrieval_top_k"]),
-                )
-                document_aggregates.append(document_tables.aggregates)
-                document_pairs.append(document_tables.pairs)
-                document_errors.append(document_tables.errors)
-                if documents:
-                    announce_stage(
-                        workflow,
-                        "testing",
-                        f"{task.capitalize()} document inference finished.",
-                    )
-            if not documents:
-                announce_stage(workflow, "testing", "No DOCX files selected; testing skipped.")
+                for dataset in datasets
+            ]
+        else:
+            dataset_inputs = [
+                ("default", Path(autotest_dir), Path(test_docx_dir), document_paths)
+            ]
 
-        announce_stage(workflow, "results", "Writing score and review artifacts.")
-        scores = concatenate_tables([tables.scores for tables in validation_tables])
+        inference_runs = []
+        for dataset_name, review_dir, document_dir, paths in dataset_inputs:
+            with selected_docx_files(paths) as documents:
+                if not documents:
+                    announce_stage(
+                        workflow,
+                        "testing",
+                        f"No DOCX files selected for {dataset_name}; testing skipped.",
+                    )
+                dataset_pairs = []
+                for task in ("binary", "ternary"):
+                    if documents:
+                        announce_stage(
+                            workflow,
+                            "testing",
+                            f"Starting {dataset_name} {task} full RAG inference for "
+                            f"{len(documents)} document(s).",
+                        )
+                    document_predictor = CausalPredictor(
+                        loaded.model,
+                        loaded.tokenizer,
+                        task,
+                        batch_size=int(parameters["document_batch_size"]),
+                        max_input_length=int(parameters["max_input_length"]),
+                        max_new_tokens=int(parameters["max_new_tokens"]),
+                    )
+                    tables = run_document_inference(
+                        documents,
+                        predictor=document_predictor,
+                        retriever=retriever,
+                        model_id=spec.model_id,
+                        task=task,
+                        top_k=int(parameters["retrieval_top_k"]),
+                    )
+                    document_aggregates.append(
+                        add_test_dataset(tables.aggregates, dataset_name)
+                    )
+                    labeled_pairs = add_test_dataset(tables.pairs, dataset_name)
+                    dataset_pairs.append(labeled_pairs)
+                    document_pairs.append(labeled_pairs)
+                    document_errors.append(add_test_dataset(tables.errors, dataset_name))
+                    if documents:
+                        announce_stage(
+                            workflow,
+                            "testing",
+                            f"{dataset_name} {task} document inference finished.",
+                        )
+            inference_runs.append(
+                (
+                    dataset_name,
+                    review_dir,
+                    document_dir,
+                    tuple(documents),
+                    concatenate_tables(dataset_pairs),
+                )
+            )
+
         combined_document_pairs = concatenate_tables(document_pairs)
+        autotest_tables = []
+        if score_autotest:
+            announce_stage(
+                workflow, "scoring", "Scoring fresh document pairs against autotest."
+            )
+            for dataset_name, review_dir, document_dir, documents, pairs in inference_runs:
+                if not documents:
+                    continue
+                for task in ("binary", "ternary"):
+                    autotest_tables.append(
+                        score_autotest_predictions(
+                            pairs,
+                            documents,
+                            model_id=spec.model_id,
+                            task=task,
+                            autotest_dir=review_dir,
+                            docx_dir=document_dir,
+                            test_dataset=dataset_name,
+                        )
+                    )
+        announce_stage(workflow, "results", "Writing score and review artifacts.")
+        scores = concatenate_tables(
+            [tables.scores for tables in validation_tables]
+            + [tables.scores for tables in autotest_tables]
+        )
         workbook = write_results_workbook(
             f"ready_llm_{slugify_model_id(spec.model_id)}",
             {
                 "scores": scores,
                 "per_class": concatenate_tables(
                     [tables.per_class for tables in validation_tables]
+                    + [tables.per_class for tables in autotest_tables]
                 ),
                 "confusion_matrix": concatenate_tables(
                     [tables.confusion_matrix for tables in validation_tables]
+                    + [tables.confusion_matrix for tables in autotest_tables]
                 ),
                 "validation_predictions": concatenate_tables(
                     [tables.predictions for tables in validation_tables]
@@ -246,6 +321,21 @@ def run_llm_evaluation(
                 "document_aggregates": concatenate_tables(document_aggregates),
                 "document_pairs": combined_document_pairs,
                 "errors": concatenate_tables(document_errors),
+                "rag_summary": concatenate_tables(
+                    [tables.rag_summary for tables in autotest_tables]
+                ),
+                "autotest_alignment": concatenate_tables(
+                    [tables.alignment for tables in autotest_tables]
+                ),
+                "inferred_gold": concatenate_tables(
+                    [tables.inferred_gold for tables in autotest_tables]
+                ),
+                "autotest_excluded": concatenate_tables(
+                    [tables.excluded for tables in autotest_tables]
+                ),
+                "file_matching": concatenate_tables(
+                    [tables.file_matching for tables in autotest_tables]
+                ).drop_duplicates() if autotest_tables else None,
             },
             {
                 "workflow": "ready_llm_evaluation",
@@ -261,6 +351,11 @@ def run_llm_evaluation(
                 "rag_commit": rag_commit,
                 "compute_dtype": loaded.compute_dtype,
                 "summary_enabled": False,
+                "autotest_enabled": score_autotest,
+                "multiple_test": multiple_test,
+                "test_datasets": [run[0] for run in inference_runs],
+                "autotest_dir": Path(autotest_dir),
+                "test_docx_dir": Path(test_docx_dir),
                 "reproducibility": reproducibility,
                 "bitwise_reproducibility_scope": "same code, lockfile, GPU model, driver, and CUDA stack",
             },

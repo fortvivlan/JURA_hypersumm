@@ -33,6 +33,8 @@ DEFAULT_RAG_REPOSITORY = "https://github.com/fortvivlan/dms-rag"
 DEFAULT_RAG_DIR = Path("/content/dms-rag")
 DEFAULT_DRIVE_ROOT = Path("/content/drive/MyDrive/jura")
 DEFAULT_RESULTS_DIR = Path("/content/jura_results")
+DEFAULT_AUTOTEST_DIR = REPOSITORY_ROOT / "autotest"
+DEFAULT_TEST_DOCX_DIR = REPOSITORY_ROOT / "test_docx"
 DEFAULT_BERT_REVISION = "89deeaa197d9d146e5763ac1f5fe32bf66817126"
 DEFAULT_EMBEDDING_REVISION = DEFAULT_BERT_REVISION
 DEFAULT_RAG_REVISION = "main"
@@ -454,6 +456,7 @@ def evaluate_predictions(
             {
                 "model": model_id,
                 "task": task,
+                "evaluation_scope": "validation",
                 "support": len(gold),
                 "accuracy": accuracy_score(gold, normalized),
                 "macro_precision": macro[0],
@@ -464,6 +467,7 @@ def evaluate_predictions(
                 "contradiction_recall": per_values[1][contradiction_index],
                 "contradiction_f1": per_values[2][contradiction_index],
                 "invalid_predictions": normalized.count("invalid"),
+                "rag_misses": 0,
             }
         ]
     )
@@ -472,6 +476,7 @@ def evaluate_predictions(
             {
                 "model": model_id,
                 "task": task,
+                "evaluation_scope": "validation",
                 "label": label,
                 "precision": per_values[0][index],
                 "recall": per_values[1][index],
@@ -488,6 +493,7 @@ def evaluate_predictions(
             {
                 "model": model_id,
                 "task": task,
+                "evaluation_scope": "validation",
                 "gold_label": gold_label,
                 "predicted_label": predicted_label,
                 "count": int(matrix[row, column]),

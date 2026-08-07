@@ -223,20 +223,21 @@ Unknown hyperparameter names raise an error instead of being ignored.
 ### Native Windows LoRA notebook
 
 [`lora_local.ipynb`](lora_local.ipynb) runs the same LoRA training, validation,
-RAG, inference, and reporting workflow from a native Windows Jupyter kernel.
+RAG, benchmark inference, scoring, and reporting workflow from a native Windows Jupyter kernel.
 It is not intended for WSL. The selected interpreter must already have the
 project dependencies installed, `git` must be on `PATH`, and an NVIDIA CUDA
 GPU is required.
 
-Open the notebook from within this repository and run its cells in order. Put
-any test decisions in `local_docx/`; an empty folder skips document inference.
-The final cell is:
+Open the notebook from within this repository and run its cells in order. By
+default it uses every matched DOCX in `test_docx/` and reviewed workbook in
+`autotest/`; set `DOCUMENT_PATHS` to an explicit list to override the benchmark
+with private decisions. The final cell is:
 
 ```python
 scores = run("ministral", "ternary")
 ```
 
-The notebook's wrapper passes explicit local paths to the reusable
+The notebook's wrapper passes explicit local artifact paths to the reusable
 `jura_hypersumm.lora.run` function. It clones the pinned RAG repository into
 `dms-rag/`, stores final adapters in `local_artifacts/models/lora/`, and writes
 XLSX/ZIP results to `local_results/`. Local DOCX inputs are never deleted;
@@ -255,13 +256,50 @@ scores = run(
 )
 ```
 
-### Results and uploaded documents
+### Benchmark scoring and results
 
-Every public workflow returns and displays its main `pandas.DataFrame` score
-table. It also downloads one XLSX workbook containing summary and per-class
-metrics, a confusion matrix, raw validation predictions, document-level
-aggregates, every retrieved premise/pair prediction, errors, and reproducibility
-metadata. Results are written under `/content/jura_results`, not Drive.
+Every full document workflow runs the repository benchmark by default. Each
+reviewed XLSX in `autotest/` is matched to one DOCX in `test_docx/` by surname,
+or by its first organization-name word; leading `Тест` and `ООО` words and filename
+decorations do not affect matching. Explicit `document_paths` override the
+default set, while `score_autotest=False` disables scoring. The five excluded
+decisions are retained separately in `problematic_docx/`.
+
+Set `multiple_test=True` to evaluate paired immediate child folders separately,
+for example `test_docx/Dialogue` against `autotest/Dialogue` and then
+`test_docx/Full` against `autotest/Full`:
+
+```python
+scores = run(
+    "ministral",
+    "ternary",
+    multiple_test=True,
+)
+```
+
+The flag is available on the BERT, LoRA, ready-LLM, and standalone scoring
+interfaces and defaults to `False`, preserving root-level discovery. All child
+folder names must be paired between the two roots. Explicit `document_paths`
+still take precedence over child-folder discovery.
+The scorer accepts both current `model_predictions` review sheets and the
+legacy single-sheet Dialogue files, where `prediction` is the reviewed label
+and the article reference is recovered from the premise text.
+
+Fresh pairs are aligned by document, hypothesis, premise, and article reference;
+the historical `model_prediction` column in the reviewed workbook is ignored.
+A newly retrieved pair absent from XLSX receives gold `not mentioned` for a
+ternary task or `no` for a binary task. A reviewed relevant pair absent from
+current retrieval is a RAG miss. Ternary totals count missed contradictions and
+entailments as false negatives. Binary totals count only missed contradictions;
+missed entailments are omitted.
+
+Every workflow returns and displays one score table with `validation`,
+`autotest_model`, and `autotest_total` scopes. Multi-dataset benchmark rows also
+carry a `test_dataset` column such as `Dialogue` or `Full`. The XLSX additionally contains
+per-class metrics, confusion matrices, current and manually marked RAG counts,
+pair alignment, inferred-gold pairs, excluded rows, file matching, raw
+predictions, errors, and reproducibility metadata. Results are written under
+`/content/jura_results`, not Drive.
 Reused-model workbooks record `used_existing_model=True` and
 `training_skipped=True`; their training-history sheet is copied from the saved
 artifact manifest when available.
@@ -270,6 +308,30 @@ Long-running Colab workflows print immediately flushed `[JURA]` stage messages
 before and after model loading or reuse, training, each validation task, RAG
 setup, document testing, and result generation. Training and per-document
 inference retain their batch/sentence progress bars.
+
+An existing results workbook can be rescored without loading a model:
+
+```python
+from jura_hypersumm.autotest_scoring import run_autotest_scoring
+
+scores = run_autotest_scoring(
+    "local_results/lora_results.xlsx",
+    autotest_dir="autotest",
+    docx_dir="test_docx",
+    multiple_test=True,
+    output_dir="local_results",
+)
+```
+
+```bash
+python -m jura_hypersumm.autotest_scoring RESULTS.xlsx \
+  --autotest-dir autotest --docx-dir test_docx --multiple-test \
+  --output-dir local_results
+```
+
+Standalone scoring requires pandas, openpyxl, and scikit-learn and does not
+need a GPU. Full workflows retain their existing batch-size, precision,
+quantization, device, and checkpointing controls.
 
 When at least one document is successfully analysed, the workflow also
 downloads a ZIP prepared for human review. For every document/task it contains
@@ -281,6 +343,8 @@ article number, part, and point where available, for example
 columns so the predictions can later be scored against human labels. No separate
 top-ranked RAG workbook is generated; all retrieved candidates remain available
 in the model workbook and in the detailed main results workbook.
+In multi-dataset runs, these workbooks are stored below dataset-named folders in
+the ZIP so duplicate Dialogue and Full filenames remain distinct.
 
 LoRA and BERT runs produce one model-prediction workbook per document. A ready
 LLM run produces binary and ternary model-prediction workbooks for each
