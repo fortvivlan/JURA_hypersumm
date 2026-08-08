@@ -35,7 +35,7 @@ def require_cuda():
 def load_causal_model(
     spec: ModelSpec,
     *,
-    revision: str,
+    revision: str | None,
     token: str | None,
     quantization: bool = True,
     device_map: Any = "auto",
@@ -106,6 +106,7 @@ class CausalPredictor:
         batch_size: int = 1,
         max_input_length: int = 4096,
         max_new_tokens: int = 16,
+        prompt_text: str | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -113,6 +114,7 @@ class CausalPredictor:
         self.batch_size = batch_size
         self.max_input_length = max_input_length
         self.max_new_tokens = max_new_tokens
+        self.prompt_text = prompt_text
 
     def predict_examples(
         self,
@@ -126,7 +128,13 @@ class CausalPredictor:
             raise ValueError("Premises and hypotheses must have equal length")
         torch = require_cuda()
         prompts = [
-            build_generation_prompt(self.tokenizer, premise, hypothesis, self.task)
+            build_generation_prompt(
+                self.tokenizer,
+                premise,
+                hypothesis,
+                self.task,
+                prompt_text=self.prompt_text,
+            )
             for premise, hypothesis in zip(premises, hypotheses)
         ]
         predictions: list[ModelPrediction] = []

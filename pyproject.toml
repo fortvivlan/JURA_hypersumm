@@ -21,9 +21,11 @@ dependencies = [
 colab = [
     "accelerate>=1.2,<2",
     "bitsandbytes>=0.45,<1",
+    "datasets>=3.2,<5",
     "faiss-cpu>=1.9,<2",
     "langchain-community>=0.3,<1",
     "langchain-huggingface>=0.1,<2",
+    "langchain-text-splitters>=0.3,<2",
     "peft>=0.13,<1",
     "sentence-transformers>=3.3,<6",
     "torch>=2.4,<3",
@@ -39,7 +41,19 @@ dev = [
 testpaths = ["tests"]
 
 [tool.setuptools]
-py-modules = ["convert_datasets", "prompt", "prompt_binary"]
+py-modules = [
+    "convert_datasets",
+    "prompt",
+    "prompt_binary",
+    "run_lora_alpha_local",
+    "run_lora_dropout_local",
+    "run_lora_lr_experiments_local",
+    "run_lora_rank_local",
+    "run_lora_target_modules_local",
+    "run_lora_vs_llm_comparison_local",
+    "run_rag_experiment_local",
+    "run_full_pipeline_evaluation_local",
+]
 
 [tool.setuptools.packages.find]
 include = ["jura_hypersumm*"]

@@ -8,13 +8,16 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .common import (
     DEFAULT_EMBEDDING_REVISION,
     DEFAULT_RAG_REPOSITORY,
     DEFAULT_RAG_REVISION,
 )
+
+if TYPE_CHECKING:
+    from .rag.reranking import Reranker
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,17 @@ class RetrievalRecord:
     citation: Citation
     detected_citations: tuple[Citation, ...] = ()
     unresolved_citations: tuple[Citation, ...] = ()
+    initial_rank: int | None = None
+    reranker_score: float | None = None
+
+
+@dataclass(frozen=True)
+class RetrievalOutcome:
+    """Candidate pool and final records for one retrieval request."""
+
+    candidates: tuple[RetrievalRecord, ...]
+    results: tuple[RetrievalRecord, ...]
+    reranked: bool
 
 
 _NUMBER = r"[0-9]+(?:\.[0-9]+)*"
@@ -390,7 +404,13 @@ def ensure_rag_repository(
 class PremiseRetriever:
     """Retrieve exact codex provisions before falling back to FAISS."""
 
-    def __init__(self, codex_dataframe, vectorstore: Any):
+    def __init__(
+        self,
+        codex_dataframe,
+        vectorstore: Any,
+        *,
+        reranker: "Reranker | None" = None,
+    ):
         required = {"text", "source"}
         if not required.issubset(codex_dataframe.columns):
             raise ValueError("codex.csv must contain text and source columns")
@@ -421,6 +441,7 @@ class PremiseRetriever:
             for code, values in aliases.items()
         }
         self._vectorstore = vectorstore
+        self._reranker = reranker
 
     @classmethod
     def from_rag_directory(
@@ -432,25 +453,46 @@ class PremiseRetriever:
         embedding_device: str = "cpu",
     ) -> "PremiseRetriever":
         """Load trusted cloned codex and FAISS artifacts."""
+        return cls.from_components(
+            Path(rag_dir) / "codex.csv",
+            Path(rag_dir) / "faiss_index",
+            embedding_model=embedding_model,
+            embedding_revision=embedding_revision,
+            embedding_device=embedding_device,
+        )
+
+    @classmethod
+    def from_components(
+        cls,
+        codex_path: str | Path,
+        index_dir: str | Path,
+        *,
+        embedding_model: str = "ai-forever/sbert_large_nlu_ru",
+        embedding_revision: str | None = DEFAULT_EMBEDDING_REVISION,
+        embedding_device: str = "cpu",
+        normalize_embeddings: bool = False,
+        reranker: "Reranker | None" = None,
+    ) -> "PremiseRetriever":
+        """Load trusted corpus/index paths with their matching encoder."""
         import pandas as pd
         from langchain_community.vectorstores import FAISS
         from langchain_huggingface import HuggingFaceEmbeddings
 
-        rag_dir = Path(rag_dir).resolve()
-        dataframe = pd.read_csv(rag_dir / "codex.csv")
+        dataframe = pd.read_csv(Path(codex_path).resolve())
+        model_kwargs: dict[str, str] = {"device": embedding_device}
+        if embedding_revision is not None and not Path(embedding_model).exists():
+            model_kwargs["revision"] = embedding_revision
         embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model,
-            model_kwargs={
-                "device": embedding_device,
-                "revision": embedding_revision,
-            },
+            model_kwargs=model_kwargs,
+            encode_kwargs={"normalize_embeddings": normalize_embeddings},
         )
         vectorstore = FAISS.load_local(
-            rag_dir / "faiss_index",
+            Path(index_dir).resolve(),
             embeddings,
             allow_dangerous_deserialization=True,
         )
-        return cls(dataframe, vectorstore)
+        return cls(dataframe, vectorstore, reranker=reranker)
 
     @staticmethod
     def _code_matches(source_code: object, code: str) -> bool:
@@ -497,8 +539,20 @@ class PremiseRetriever:
             for index, row in enumerate(unique.itertuples(index=False), start=1)
         ]
 
-    def retrieve(self, hypothesis: str, *, top_k: int = 20) -> list[RetrievalRecord]:
-        """Retrieve premises, enforcing an absolute semantic top-20 limit."""
+    def retrieve_with_details(
+        self,
+        hypothesis: str,
+        *,
+        top_k: int = 20,
+        final_top_k: int | None = None,
+    ) -> RetrievalOutcome:
+        """Retrieve candidates and optionally rerank semantic fallback records."""
+        candidate_top_k = int(top_k)
+        retained_top_k = candidate_top_k if final_top_k is None else int(final_top_k)
+        if candidate_top_k <= 0 or retained_top_k <= 0:
+            raise ValueError("top_k and final_top_k must be positive")
+        if retained_top_k > candidate_top_k:
+            raise ValueError("final_top_k cannot exceed top_k")
         citations = extract_citations(hypothesis, code_aliases=self._code_aliases)
         exact: list[RetrievalRecord] = []
         unresolved: list[Citation] = []
@@ -517,21 +571,22 @@ class PremiseRetriever:
         detected_tuple = tuple(citations)
         unresolved_tuple = tuple(unresolved)
         if exact:
-            return [
+            results = tuple(
                 replace(
                     record,
                     rank=rank,
+                    initial_rank=rank,
                     detected_citations=detected_tuple,
                     unresolved_citations=unresolved_tuple,
                 )
                 for rank, record in enumerate(exact, start=1)
-            ]
-        bounded_k = max(1, min(int(top_k), 20))
+            )
+            return RetrievalOutcome(results, results, False)
         matches = self._vectorstore.similarity_search_with_score(
-            hypothesis, k=bounded_k
+            hypothesis, k=candidate_top_k
         )
         fallback_citation = citations[0] if len(citations) == 1 else Citation()
-        return [
+        candidates = tuple(
             RetrievalRecord(
                 premise=str(document.page_content),
                 source=str(document.metadata.get("source", "")),
@@ -541,9 +596,35 @@ class PremiseRetriever:
                 citation=fallback_citation,
                 detected_citations=detected_tuple,
                 unresolved_citations=detected_tuple,
+                initial_rank=index,
             )
             for index, (document, score) in enumerate(matches, start=1)
-        ]
+        )
+        if self._reranker is None:
+            return RetrievalOutcome(candidates, candidates[:retained_top_k], False)
+        from .rag.reranking import rerank_records
+
+        results = rerank_records(
+            hypothesis,
+            candidates,
+            self._reranker,
+            final_top_k=retained_top_k,
+        )
+        return RetrievalOutcome(candidates, results, True)
+
+    def retrieve(
+        self,
+        hypothesis: str,
+        *,
+        top_k: int = 20,
+        final_top_k: int | None = None,
+    ) -> list[RetrievalRecord]:
+        """Return final exact or semantic retrieval records."""
+        return list(
+            self.retrieve_with_details(
+                hypothesis, top_k=top_k, final_top_k=final_top_k
+            ).results
+        )
 
 
 def citation_dict(citation: Citation) -> dict[str, str | None]:

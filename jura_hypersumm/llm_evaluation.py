@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .colab_support import (
-    download_file,
+    deliver_file,
     get_huggingface_token,
-    require_colab,
     selected_docx_files,
 )
 from .autotest_scoring import (
@@ -120,7 +119,6 @@ def run_llm_evaluation(
     are used. ``multiple_test=True`` evaluates paired child folders separately.
     The returned table combines validation and autotest scores.
     """
-    require_colab()
     parameters = merge_parameters(DEFAULT_INFERENCE_PARAMETERS, inference_parameters)
     configure_reproducibility(
         int(parameters["seed"]),
@@ -367,9 +365,9 @@ def run_llm_evaluation(
             output_dir=results_dir,
         )
         display_scores(scores)
-        download_file(workbook)
+        deliver_file(workbook)
         if review_package is not None:
-            download_file(review_package)
+            deliver_file(review_package)
         announce_stage(workflow, "complete", "Workflow finished.")
         return scores
     finally:

@@ -13,6 +13,7 @@ from jura_hypersumm.retrieval import (
     extract_citations,
     parse_codex_source,
 )
+from jura_hypersumm.rag.reranking import score_and_sort_records
 
 
 @dataclass
@@ -31,6 +32,19 @@ class FakeVectorStore:
             (FakeDocument(f"semantic {index}", {"source": f"s{index}"}), index / 10)
             for index in range(k)
         ]
+
+
+class FakeReranker:
+    model_id = "fake/reranker"
+    revision = "revision"
+
+    def __init__(self, scores):
+        self.scores = scores
+        self.calls = []
+
+    def score(self, query, documents):
+        self.calls.append((query, list(documents)))
+        return self.scores[: len(documents)]
 
 
 def _retriever() -> tuple[PremiseRetriever, FakeVectorStore]:
@@ -202,14 +216,72 @@ def test_literal_code_aliases_are_derived_from_codex() -> None:
     assert vectorstore.calls == []
 
 
-def test_ambiguous_citation_falls_back_to_at_most_twenty() -> None:
+def test_ambiguous_citation_uses_configurable_candidate_depth() -> None:
     retriever, vectorstore = _retriever()
 
     records = retriever.retrieve("ст. 18.8 КоАП РФ", top_k=200)
 
-    assert len(records) == 20
+    assert len(records) == 200
     assert all(record.method == "faiss" for record in records)
-    assert vectorstore.calls == [("ст. 18.8 КоАП РФ", 20)]
+    assert vectorstore.calls == [("ст. 18.8 КоАП РФ", 200)]
+
+
+def test_semantic_candidates_are_reranked_then_truncated_stably() -> None:
+    retriever, vectorstore = _retriever()
+    reranker = FakeReranker([0.1, 0.9, 0.9, 0.2])
+    retriever._reranker = reranker
+
+    outcome = retriever.retrieve_with_details(
+        "без точной ссылки", top_k=4, final_top_k=2
+    )
+
+    assert vectorstore.calls == [("без точной ссылки", 4)]
+    assert [record.initial_rank for record in outcome.candidates] == [1, 2, 3, 4]
+    assert [record.initial_rank for record in outcome.results] == [2, 3]
+    assert [record.rank for record in outcome.results] == [1, 2]
+    assert [record.reranker_score for record in outcome.results] == [0.9, 0.9]
+    assert reranker.calls[0][0] == "без точной ссылки"
+
+
+def test_full_reranked_pool_retains_scores_for_dropped_candidates() -> None:
+    retriever, _ = _retriever()
+    candidates = retriever.retrieve_with_details(
+        "без точной ссылки", top_k=3, final_top_k=3
+    ).candidates
+
+    ranked = score_and_sort_records(
+        "без точной ссылки", candidates, FakeReranker([0.2, 0.9, 0.1])
+    )
+
+    assert [record.initial_rank for record in ranked] == [2, 1, 3]
+    assert [record.rank for record in ranked] == [1, 2, 3]
+    assert [record.reranker_score for record in ranked] == [0.9, 0.2, 0.1]
+
+
+def test_exact_results_bypass_reranker_and_final_truncation() -> None:
+    retriever, _ = _retriever()
+    reranker = FakeReranker([1.0])
+    retriever._reranker = reranker
+
+    outcome = retriever.retrieve_with_details(
+        "ч. 1 ст. 32.9 КоАП РФ", top_k=5, final_top_k=1
+    )
+
+    assert len(outcome.results) == 2
+    assert not outcome.reranked
+    assert reranker.calls == []
+
+
+@pytest.mark.parametrize(
+    ("candidate_top_k", "final_top_k", "message"),
+    [(0, 1, "positive"), (5, 0, "positive"), (5, 6, "cannot exceed")],
+)
+def test_retrieval_depth_validation(candidate_top_k, final_top_k, message) -> None:
+    retriever, _ = _retriever()
+    with pytest.raises(ValueError, match=message):
+        retriever.retrieve(
+            "без ссылки", top_k=candidate_top_k, final_top_k=final_top_k
+        )
 
 
 def _write_rag_artifacts(repository: Path, marker: str) -> None:

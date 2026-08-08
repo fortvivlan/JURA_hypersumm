@@ -67,11 +67,18 @@ DEFAULT_LORA_HYPERPARAMETERS: dict[str, Any] = {
     "gradient_accumulation_steps": 8,
     "epochs": 3,
     "learning_rate": 2e-4,
+    "lr_scheduler_type": "cosine",
     "warmup_ratio": 0.05,
     "weight_decay": 0.0,
     "max_grad_norm": 1.0,
     "gradient_checkpointing": True,
+    "optimizer": "auto",
     "logging_steps": 20,
+    "eval_strategy": "no",
+    "eval_batch_size": 8,
+    "save_strategy": "no",
+    "save_total_limit": None,
+    "load_best_model_at_end": False,
     "num_workers": 0,
     "quantization": True,
     "device_map": "auto",
@@ -165,14 +172,30 @@ def _tokenize_training_rows(
     return rows
 
 
+class _TokenizedRowsDataset:
+    """Minimal picklable dataset wrapper for pre-tokenized LoRA examples."""
+
+    def __init__(self, rows: Sequence[Mapping[str, Sequence[int]]]):
+        self._rows = list(rows)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> Mapping[str, Sequence[int]]:
+        return self._rows[index]
+
+
 def _train_adapter(
     dataframe,
     *,
+    validation_dataframe=None,
     spec,
     task: Task,
     revision: str,
     token: str | None,
     parameters: Mapping[str, Any],
+    trainer_output_dir: str | Path | None = None,
+    resume_from_checkpoint: str | Path | bool | None = None,
 ):
     import torch
     from peft import (
@@ -180,7 +203,6 @@ def _train_adapter(
         get_peft_model,
         prepare_model_for_kbit_training,
     )
-    from torch.utils.data import Dataset
     from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
     loaded = load_causal_model(
@@ -218,31 +240,59 @@ def _train_adapter(
         int(parameters["max_seq_length"]),
         model_alias=spec.alias,
     )
-
-    class TokenDataset(Dataset):
-        def __len__(self):
-            return len(tokenized_rows)
-
-        def __getitem__(self, index):
-            return tokenized_rows[index]
+    eval_strategy = str(parameters["eval_strategy"])
+    tokenized_validation_rows = None
+    if eval_strategy != "no":
+        if validation_dataframe is None:
+            raise ValueError(
+                "validation_dataframe is required when eval_strategy is enabled"
+            )
+        tokenized_validation_rows = _tokenize_training_rows(
+            validation_dataframe,
+            tokenizer,
+            task,
+            int(parameters["max_seq_length"]),
+            model_alias=spec.alias,
+        )
 
     use_bf16 = loaded.compute_dtype == "bfloat16"
+    optimizer = str(parameters["optimizer"])
+    if optimizer == "auto":
+        optimizer = (
+            "paged_adamw_8bit"
+            if bool(parameters["quantization"])
+            else "adamw_torch"
+        )
+    output_dir = Path(
+        trainer_output_dir
+        or (
+            "/content/jura_lora_trainer"
+            if Path("/content").is_dir()
+            else "./jura_lora_trainer"
+        )
+    )
+    save_total_limit = parameters["save_total_limit"]
     training_args = TrainingArguments(
-        output_dir="/content/jura_lora_trainer" if Path("/content").is_dir() else "./jura_lora_trainer",
+        output_dir=str(output_dir),
         num_train_epochs=float(parameters["epochs"]),
         per_device_train_batch_size=int(parameters["batch_size"]),
+        per_device_eval_batch_size=int(parameters["eval_batch_size"]),
         gradient_accumulation_steps=int(parameters["gradient_accumulation_steps"]),
         gradient_checkpointing=bool(parameters["gradient_checkpointing"]),
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_8bit" if bool(parameters["quantization"]) else "adamw_torch",
+        optim=optimizer,
         learning_rate=float(parameters["learning_rate"]),
-        lr_scheduler_type="cosine",
+        lr_scheduler_type=str(parameters["lr_scheduler_type"]),
         warmup_ratio=float(parameters["warmup_ratio"]),
         weight_decay=float(parameters["weight_decay"]),
         max_grad_norm=float(parameters["max_grad_norm"]),
         logging_steps=int(parameters["logging_steps"]),
-        save_strategy="no",
-        eval_strategy="no",
+        save_strategy=str(parameters["save_strategy"]),
+        save_total_limit=(
+            None if save_total_limit is None else int(save_total_limit)
+        ),
+        eval_strategy=eval_strategy,
+        load_best_model_at_end=bool(parameters["load_best_model_at_end"]),
         bf16=use_bf16,
         fp16=not use_bf16,
         report_to="none",
@@ -263,10 +313,21 @@ def _train_adapter(
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=TokenDataset(),
+        train_dataset=_TokenizedRowsDataset(tokenized_rows),
+        eval_dataset=(
+            _TokenizedRowsDataset(tokenized_validation_rows)
+            if tokenized_validation_rows is not None
+            else None
+        ),
         data_collator=collator,
     )
-    train_output = trainer.train()
+    train_output = trainer.train(
+        resume_from_checkpoint=(
+            str(resume_from_checkpoint)
+            if isinstance(resume_from_checkpoint, Path)
+            else resume_from_checkpoint
+        )
+    )
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
     model.config.use_cache = True
@@ -337,6 +398,8 @@ def run(
     score_autotest: bool = True,
     multiple_test: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
+    trainer_output_dir: str | Path | None = None,
+    resume_from_checkpoint: str | Path | bool | None = None,
 ):
     """Train or reuse, validate, and document-test one task LoRA adapter.
 
@@ -348,6 +411,8 @@ def run(
     Set ``score_autotest=False`` to disable benchmark scoring, or
     ``multiple_test=True`` to evaluate paired child folders separately. The
     function returns the combined validation and autotest score table.
+    ``trainer_output_dir`` optionally isolates Trainer checkpoints and logs.
+    ``resume_from_checkpoint`` resumes a compatible interrupted Trainer run.
     """
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
@@ -459,11 +524,14 @@ def run(
             )
             model, tokenizer, compute_dtype, history, training_metrics = _train_adapter(
                 train_dataframe,
+                validation_dataframe=val_dataframe,
                 spec=spec,
                 task=validated_task,
                 revision=effective_revision,
                 token=token,
                 parameters=parameters,
+                trainer_output_dir=trainer_output_dir,
+                resume_from_checkpoint=resume_from_checkpoint,
             )
             adapter_target.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(adapter_target, safe_serialization=True)

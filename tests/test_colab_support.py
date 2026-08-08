@@ -52,3 +52,16 @@ def test_local_artifact_root_is_created(monkeypatch, tmp_path: Path) -> None:
 
     assert resolved == target.resolve()
     assert resolved.is_dir()
+
+
+def test_local_file_delivery_reports_path_without_deleting(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(colab_support, "is_colab", lambda: False)
+    artifact = tmp_path / "scores.xlsx"
+    artifact.write_bytes(b"scores")
+
+    colab_support.deliver_file(artifact)
+
+    assert artifact.read_bytes() == b"scores"
+    assert str(artifact.resolve()) in capsys.readouterr().out

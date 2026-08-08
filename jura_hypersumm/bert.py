@@ -9,10 +9,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .colab_support import (
-    download_file,
+    deliver_file,
     get_huggingface_token,
-    mount_drive,
-    require_colab,
+    prepare_artifact_root,
     selected_docx_files,
 )
 from .autotest_scoring import (
@@ -73,6 +72,45 @@ DEFAULT_BERT_PARAMETERS: dict[str, Any] = {
     "seed": 42,
     "deterministic": True,
 }
+
+
+class _BertPairDataset:
+    """Pickle-safe pair dataset for spawn-based DataLoader workers."""
+
+    def __init__(self, dataframe, label2id: Mapping[str, int]):
+        rows = dataframe.reset_index(drop=True)
+        self.premises = rows["premise"].tolist()
+        self.hypotheses = rows["hypothesis"].tolist()
+        self.labels = [label2id[label] for label in rows["tag"]]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int) -> tuple[str, str, int]:
+        return self.premises[index], self.hypotheses[index], self.labels[index]
+
+
+class _BertBatchCollator:
+    """Tokenize pair batches in a pickle-safe DataLoader callable."""
+
+    def __init__(self, tokenizer, *, max_length: int):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, rows):
+        import torch
+
+        premises, hypotheses, labels = zip(*rows)
+        encoded = self.tokenizer(
+            list(premises),
+            list(hypotheses),
+            max_length=self.max_length,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        encoded["labels"] = torch.tensor(labels, dtype=torch.long)
+        return encoded
 
 
 class BertPredictor:
@@ -178,7 +216,7 @@ def _train_bert(
 ):
     import torch
     from sklearn.metrics import f1_score
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
     from transformers import (
         AutoModelForSequenceClassification,
@@ -203,46 +241,25 @@ def _train_bert(
     if bool(parameters["gradient_checkpointing"]):
         model.gradient_checkpointing_enable()
 
-    class PairDataset(Dataset):
-        def __init__(self, dataframe):
-            self.rows = dataframe.reset_index(drop=True)
-
-        def __len__(self):
-            return len(self.rows)
-
-        def __getitem__(self, index):
-            row = self.rows.iloc[index]
-            return row["premise"], row["hypothesis"], label2id[row["tag"]]
-
-    def collate(rows):
-        premises, hypotheses, labels = zip(*rows)
-        encoded = tokenizer(
-            list(premises),
-            list(hypotheses),
-            max_length=int(parameters["max_length"]),
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
-        encoded["labels"] = torch.tensor(labels, dtype=torch.long)
-        return encoded
-
     generator = torch.Generator().manual_seed(int(parameters["seed"]))
+    collator = _BertBatchCollator(
+        tokenizer, max_length=int(parameters["max_length"])
+    )
     train_loader = DataLoader(
-        PairDataset(train_dataframe),
+        _BertPairDataset(train_dataframe, label2id),
         batch_size=int(parameters["batch_size"]),
         shuffle=True,
-        collate_fn=collate,
+        collate_fn=collator,
         num_workers=int(parameters["num_workers"]),
         pin_memory=device.type == "cuda",
         generator=generator,
         worker_init_fn=seed_data_loader_worker,
     )
     val_loader = DataLoader(
-        PairDataset(val_dataframe),
+        _BertPairDataset(val_dataframe, label2id),
         batch_size=int(parameters["inference_batch_size"]),
         shuffle=False,
-        collate_fn=collate,
+        collate_fn=collator,
         num_workers=int(parameters["num_workers"]),
         pin_memory=device.type == "cuda",
         worker_init_fn=seed_data_loader_worker,
@@ -356,14 +373,13 @@ def _run_bert(
     multiple_test: bool,
     results_dir: str | Path,
 ):
-    require_colab()
     workflow = f"bert/{task}"
-    announce_stage(workflow, "setup", "Preparing datasets and Google Drive paths.")
+    announce_stage(workflow, "setup", "Preparing datasets and artifact paths.")
     train_path = Path(train_path or default_dataset_path("train", task))
     val_path = Path(val_path or default_dataset_path("val", task))
     train_hash = file_sha256(train_path)
     val_hash = file_sha256(val_path)
-    project_drive = mount_drive(drive_root)
+    project_drive = prepare_artifact_root(drive_root)
     model_target = project_drive / "models" / "bert" / task
     artifact_manifest: dict[str, Any] | None = None
     if use_existing_model:
@@ -685,9 +701,9 @@ def _run_bert(
             output_dir=results_dir,
         )
         display_scores(combined_scores)
-        download_file(workbook)
+        deliver_file(workbook)
         if review_package is not None:
-            download_file(review_package)
+            deliver_file(review_package)
         announce_stage(workflow, "complete", "Workflow finished.")
         return combined_scores
     finally:
@@ -724,9 +740,10 @@ def run_bert_binary(
 ):
     """Train or reuse, validate, and document-test the binary BERT baseline.
 
-    ``use_existing_model=True`` requires a compatible final model in Drive and
-    skips training completely. ``multiple_test=True`` evaluates paired child
-    folders below the autotest and DOCX roots as separate datasets.
+    ``use_existing_model=True`` requires a compatible final model in the
+    configured artifact root and skips training completely.
+    ``multiple_test=True`` evaluates paired child folders below the autotest
+    and DOCX roots as separate datasets.
     """
     return _run_bert(
         "binary",
@@ -768,9 +785,10 @@ def run_bert_ternary(
 ):
     """Train or reuse, validate, and document-test the ternary BERT baseline.
 
-    ``use_existing_model=True`` requires a compatible final model in Drive and
-    skips training completely. ``multiple_test=True`` evaluates paired child
-    folders below the autotest and DOCX roots as separate datasets.
+    ``use_existing_model=True`` requires a compatible final model in the
+    configured artifact root and skips training completely.
+    ``multiple_test=True`` evaluates paired child folders below the autotest
+    and DOCX roots as separate datasets.
     """
     return _run_bert(
         "ternary",

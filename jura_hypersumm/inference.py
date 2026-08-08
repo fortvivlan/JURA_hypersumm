@@ -64,6 +64,7 @@ def run_document_inference(
     model_id: str,
     task: Task,
     top_k: int = 20,
+    final_top_k: int | None = None,
 ) -> DocumentInferenceTables:
     """Run operative-section sentence retrieval and classification for DOCX files."""
     import pandas as pd
@@ -103,7 +104,12 @@ def run_document_inference(
                 leave=False,
             ):
                 hypothesis_id = f"{document_path.name}:{sentence_index:05d}"
-                retrieved = retriever.retrieve(hypothesis, top_k=top_k)
+                if final_top_k is None:
+                    retrieved = retriever.retrieve(hypothesis, top_k=top_k)
+                else:
+                    retrieved = retriever.retrieve(
+                        hypothesis, top_k=top_k, final_top_k=final_top_k
+                    )
                 if not retrieved:
                     error_rows.append(
                         {
@@ -139,7 +145,9 @@ def run_document_inference(
                             "source": record.source,
                             "retrieval_method": record.method,
                             "retrieval_rank": record.rank,
+                            "retrieval_initial_rank": record.initial_rank,
                             "retrieval_score": record.score,
+                            "reranker_score": record.reranker_score,
                             **citation_dict(record.citation),
                             "detected_citations": citations_json(
                                 record.detected_citations

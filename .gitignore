@@ -218,6 +218,7 @@ AGENTS.md
 /autotest/
 /test_docx/
 /problematic_docx/
+/run_all_experiments_local.py
 
 # JURA runtime artifacts (datasets and source CSVs remain trackable)
 /dms-rag/

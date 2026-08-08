@@ -22,10 +22,11 @@ def build_messages(
     task: Task,
     *,
     assistant_label: str | None = None,
+    prompt_text: str | None = None,
 ) -> list[dict[str, str]]:
     """Build chat messages without duplicating the system prompt."""
     messages = [
-        {"role": "system", "content": prompt_for_task(task)},
+        {"role": "system", "content": prompt_text or prompt_for_task(task)},
         {
             "role": "user",
             "content": f"Предпосылка: {premise}\nГипотеза: {hypothesis}",
@@ -63,12 +64,17 @@ def apply_chat_template(
 
 
 def build_generation_prompt(
-    tokenizer: Any, premise: str, hypothesis: str, task: Task
+    tokenizer: Any,
+    premise: str,
+    hypothesis: str,
+    task: Task,
+    *,
+    prompt_text: str | None = None,
 ) -> str:
     """Build one inference prompt from the canonical imported task prompt."""
     return apply_chat_template(
         tokenizer,
-        build_messages(premise, hypothesis, task),
+        build_messages(premise, hypothesis, task, prompt_text=prompt_text),
         add_generation_prompt=True,
     )
 
