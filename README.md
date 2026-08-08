@@ -14,9 +14,11 @@ that supports Russian. Deterministic citation matches always stay first in the
 pipeline and bypass both reranking and semantic top-k truncation.
 
 Required inputs are `train.xlsx`, `val.xlsx`, `dms-rag/codex.csv` and its
-baseline `faiss_index/`, all three headerless workbooks in `rag_tests/`, and
-the paired `test_docx/{Dialogue,Full}` folders. Install the GPU dependencies
-before running it:
+baseline `faiss_index/`, `rag_tests/RAG_DIALOGUE_test.xlsx`,
+`rag_tests/RAG_FULL_test.xlsx`,
+`rag_tests/RAG_FULL_additional_test.xlsx`, and the paired
+`test_docx/{Dialogue,Full}` folders. Install the GPU dependencies before
+running it:
 
 ```powershell
 uv sync --extra colab --dev
@@ -26,22 +28,22 @@ uv run python run_rag_experiment_local.py `
   --gradient-accumulation 4 `
   --embedding-device cuda `
   --index-device cpu `
-  --candidate-top-k 20 `
-  --final-top-k 20 `
   --reranker-mode pretrained
 ```
 
-`--candidate-top-k` controls how many FAISS results are scored and
-`--final-top-k` controls how many are passed to downstream classification;
-both default to 20, accept any positive integer, and require final top-k to be
-no greater than candidate top-k. For example, use `--candidate-top-k 100
---final-top-k 20` to rerank a wider pool down to 20 results.
+Every run evaluates candidate/final depths `20:10` and `40:20`. Override the
+matrix with one or more repeatable arguments such as
+`--retrieval-depth 100:20`; every depth must be positive with final no greater
+than candidate.
 The CLI also exposes reranker train/eval batch sizes, gradient accumulation,
 precision, maximum sequence length, learning rate, epochs, device, and
 gradient checkpointing for sub-24GB GPUs.
 
-The pretrained reranker is the default. To fine-tune it on the same legal
-pairs, run a separate experiment ID with `--reranker-mode finetuned`.
+The pretrained reranker is the default. This produces baseline/tuned embedding
+variants with and without that reranker. To fine-tune it on the same legal
+pairs, run a separate experiment ID with `--reranker-mode finetuned`; this
+retains the pretrained comparisons and adds baseline/tuned variants using the
+fine-tuned reranker.
 Fine-tuning uses `hypothesis` as query, `premise` as document, maps
 `contradiction`/`entailment` to relevance 1 and `not mentioned` to 0, and
 selects the best checkpoint by validation average precision. The default GTE
@@ -52,14 +54,27 @@ alternative models require `--reranker-trust-remote-code` when needed.
 The trained encoder, rebuilt index, `run_config.json`, and
 `rag_manifest.json` are written below
 `local_artifacts/rag/sbert_legal_v1/`. Converted datasets, validation
-similarities, candidate-pool recall, final Recall@1/5/10/20, per-query
-retrieval/reranker audits, unmatched sentences, and comparison deltas are
-written below
-`local_results/rag/sbert_legal_v1/`. Zero-gold and workbook sentences absent
-from the filtered DOCX pipeline are audited but excluded from recall.
-Each run evaluates baseline/tuned embeddings both without and with its selected
-reranker. Pretrained and fine-tuned rerankers should use different experiment
-IDs, keeping those comparisons independent and reproducible.
+similarities, and compact retrieval Recall are written below
+`local_results/rag/sbert_legal_v1/`. Pretrained and fine-tuned reranker runs
+should use different experiment IDs.
+
+`rag_recall.xlsx` is DOCX-driven. It starts with every hypothesis occurrence
+that survives the same operative-section extraction and sentence filtering as
+full inference, then aligns it to the corresponding workbook:
+
+- Dialogue uses `RAG_DIALOGUE_test.xlsx`.
+- Full uses `RAG_FULL_test.xlsx`, then checks
+  `RAG_FULL_additional_test.xlsx` only when the hypothesis is absent from the
+  primary workbook.
+- Missing DOCX hypotheses emit a warning, appear in `missing_hypotheses`, and
+  are excluded because their relevance is unknown.
+- Zero-article hypotheses and workbook-only hypotheses do not enter Recall.
+
+The first sheet contains one row per embedding/reranker/depth combination and
+exactly six article-level micro Recall values: FAISS-only, rules-only, and the
+production rule-first-with-FAISS-fallback system for Dialogue and Full. The
+second sheet contains only missing DOCX hypotheses. Pretrained mode writes
+eight rows (four variants at two depths); fine-tuned mode writes twelve.
 
 The Python interface accepts all important memory and reproducibility knobs:
 
@@ -71,8 +86,7 @@ scores = run_rag_experiment(
     train_path="train.xlsx",
     val_path="val.xlsx",
     rag_dir="dms-rag",
-    candidate_top_k=100,
-    final_top_k=20,
+    retrieval_depths=((20, 10), (40, 20)),
     reranker_mode="finetuned",
     hyperparameters={
         "batch_size": 4,

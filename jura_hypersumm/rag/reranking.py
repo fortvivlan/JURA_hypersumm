@@ -65,7 +65,7 @@ class CrossEncoderReranker:
             trust_remote_code=trust_remote_code,
             device=device,
             max_length=max_length,
-            model_kwargs={"torch_dtype": dtype},
+            model_kwargs={"dtype": dtype},
         )
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:

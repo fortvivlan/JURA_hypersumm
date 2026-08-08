@@ -68,7 +68,7 @@ def load_causal_model(
         "token": token,
         "trust_remote_code": spec.trust_remote_code,
         "device_map": device_map,
-        "torch_dtype": compute_dtype,
+        "dtype": compute_dtype,
     }
     if quantization:
         kwargs["quantization_config"] = BitsAndBytesConfig(

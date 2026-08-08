@@ -5,7 +5,22 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from jura_hypersumm.rag.evaluation import DEFAULT_RETRIEVAL_DEPTHS
 from jura_hypersumm.rag.training import run_rag_experiment
+
+
+def _parse_retrieval_depth(value: str) -> tuple[int, int]:
+    try:
+        candidate, final = (int(part) for part in value.split(":", maxsplit=1))
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "retrieval depth must use CANDIDATE:FINAL, for example 20:10"
+        ) from error
+    if candidate <= 0 or final <= 0 or final > candidate:
+        raise argparse.ArgumentTypeError(
+            "retrieval depth must be positive with FINAL <= CANDIDATE"
+        )
+    return candidate, final
 
 
 def _parse_args() -> argparse.Namespace:
@@ -15,10 +30,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--val", type=Path, default=Path("val.xlsx"))
     parser.add_argument("--rag-dir", type=Path, default=Path("dms-rag"))
     parser.add_argument("--rag-tests", type=Path, default=Path("rag_tests"))
+    parser.add_argument("--dialogue-workbook", type=Path)
+    parser.add_argument("--full-workbook", type=Path)
+    parser.add_argument("--full-additional-workbook", type=Path)
     parser.add_argument("--test-docx", type=Path, default=Path("test_docx"))
     parser.add_argument("--model", default="ai-forever/sbert_large_nlu_ru")
-    parser.add_argument("--candidate-top-k", type=int, default=20)
-    parser.add_argument("--final-top-k", type=int, default=20)
+    parser.add_argument(
+        "--retrieval-depth",
+        type=_parse_retrieval_depth,
+        action="append",
+        help="Repeatable CANDIDATE:FINAL pair; defaults to 20:10 and 40:20",
+    )
     parser.add_argument(
         "--reranker-mode", choices=("pretrained", "finetuned"), default="pretrained"
     )
@@ -62,10 +84,14 @@ if __name__ == "__main__":
         val_path=arguments.val,
         rag_dir=arguments.rag_dir,
         rag_test_dir=arguments.rag_tests,
+        dialogue_workbook=arguments.dialogue_workbook,
+        full_workbook=arguments.full_workbook,
+        full_additional_workbook=arguments.full_additional_workbook,
         test_docx_dir=arguments.test_docx,
         model_id=arguments.model,
-        candidate_top_k=arguments.candidate_top_k,
-        final_top_k=arguments.final_top_k,
+        retrieval_depths=(
+            arguments.retrieval_depth or DEFAULT_RETRIEVAL_DEPTHS
+        ),
         reranker_mode=arguments.reranker_mode,
         reranker_model_id=arguments.reranker_model,
         reranker_revision=arguments.reranker_revision,

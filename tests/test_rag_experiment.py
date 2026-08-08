@@ -1,16 +1,24 @@
+import argparse
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from jura_hypersumm.rag.artifacts import RagBundle
 from jura_hypersumm.rag.data import convert_embedding_dataset
 from jura_hypersumm.rag.evaluation import (
-    _comparison_deltas,
-    calculate_recall_rows,
+    SUMMARY_COLUMNS,
+    _merge_full_annotations,
+    _validate_retrieval_depths,
     read_rag_workbook,
+    run_rag_evaluation,
 )
-from jura_hypersumm.rag.artifacts import RagBundle
-from jura_hypersumm.retrieval import Citation
+from jura_hypersumm.retrieval import (
+    Citation,
+    RetrievalOutcome,
+    RetrievalRecord,
+)
+from run_rag_experiment_local import _parse_retrieval_depth
 
 
 def test_embedding_conversion_merges_only_requested_labels(tmp_path: Path) -> None:
@@ -26,12 +34,22 @@ def test_embedding_conversion_merges_only_requested_labels(tmp_path: Path) -> No
 
     converted = convert_embedding_dataset(source, "train")
 
-    assert converted["embedding_tag"].tolist() == ["similar", "similar", "not mentioned"]
+    assert converted["embedding_tag"].tolist() == [
+        "similar",
+        "similar",
+        "not mentioned",
+    ]
     assert converted["label"].tolist() == [1, 1, 0]
-    assert converted["example_id"].tolist() == ["train:000000", "train:000001", "train:000002"]
+    assert converted["example_id"].tolist() == [
+        "train:000000",
+        "train:000001",
+        "train:000002",
+    ]
 
 
-def test_headerless_rag_workbook_groups_multiple_and_zero_golds(tmp_path: Path) -> None:
+def test_headerless_rag_workbook_groups_multiple_and_zero_golds(
+    tmp_path: Path,
+) -> None:
     workbook = tmp_path / "rag.xlsx"
     pd.DataFrame(
         [
@@ -49,84 +67,209 @@ def test_headerless_rag_workbook_groups_multiple_and_zero_golds(tmp_path: Path) 
     assert rows[1]["gold_citations"] == ()
 
 
-def test_recall_curves_report_query_and_article_micro_recall() -> None:
-    one = ("коап рф", "1", "1", "")
-    two = ("коап рф", "2", "", "")
-    rows = [
-        {"gold_keys": {one, two}, "retrieved_keys": [one, two], "method": "faiss"},
-        {"gold_keys": {one}, "retrieved_keys": [two, one], "method": "exact"},
-    ]
-
-    scores = calculate_recall_rows(rows, rag_name="rag", workbook_name="test")
-    at_one = next(row for row in scores if row["branch"] == "all" and row["cutoff"] == 1)
-    at_five = next(row for row in scores if row["branch"] == "all" and row["cutoff"] == 5)
-
-    assert at_one["query_recall"] == pytest.approx(0.5)
-    assert at_one["article_micro_recall"] == pytest.approx(1 / 3)
-    assert at_five["query_recall"] == 1
-    assert at_five["article_micro_recall"] == 1
+@pytest.mark.parametrize(
+    ("depths", "message"),
+    [
+        ((), "cannot be empty"),
+        (((20, 10), (20, 10)), "duplicates"),
+        (((0, 1),), "positive"),
+        (((10, 20),), "cannot exceed"),
+    ],
+)
+def test_retrieval_depth_validation(depths, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        _validate_retrieval_depths(depths)
 
 
-def test_candidate_recall_and_dynamic_final_cutoffs() -> None:
-    gold = ("коап рф", "1", "", "")
-    rows = [
-        {
-            "gold_keys": {gold},
-            "candidate_keys": [("коап рф", "2", "", ""), gold],
-            "retrieved_keys": [("коап рф", "2", "", "")],
-            "method": "faiss",
-        }
-    ]
-
-    scores = calculate_recall_rows(
-        rows,
-        rag_name="rag",
-        workbook_name="test",
-        cutoffs=(1,),
-        candidate_top_k=2,
-    )
-
-    candidate = next(row for row in scores if row["branch"] == "all" and row["stage"] == "candidate")
-    final = next(row for row in scores if row["branch"] == "all" and row["stage"] == "final")
-    assert candidate["query_recall"] == 1
-    assert final["query_recall"] == 0
+def test_cli_retrieval_depth_parser() -> None:
+    assert _parse_retrieval_depth("20:10") == (20, 10)
+    with pytest.raises(argparse.ArgumentTypeError, match="FINAL <= CANDIDATE"):
+        _parse_retrieval_depth("10:20")
 
 
-def test_four_way_comparison_deltas() -> None:
-    variants = {
-        ("base", False): "base__no",
-        ("base", True): "base__yes",
-        ("tuned", False): "tuned__no",
-        ("tuned", True): "tuned__yes",
+def _annotation(normalized: str, articles: tuple[str, ...]) -> dict:
+    return {
+        "normalized_hypothesis": normalized,
+        "hypothesis": normalized,
+        "gold_citations": tuple(Citation("КоАП РФ", value) for value in articles),
+        "gold_references": articles,
+        "gold_texts": (),
     }
-    scores = pd.DataFrame(
-        [
-            {
-                "rag_version": name,
-                "workbook": "w",
-                "branch": "all",
-                "stage": "final",
-                "cutoff": 1,
-                "query_recall": value,
-                "article_micro_recall": value,
-            }
-            for name, value in (
-                ("base__no", 0.2),
-                ("base__yes", 0.3),
-                ("tuned__no", 0.4),
-                ("tuned__yes", 0.6),
-            )
-        ]
-    )
-    bundles = [
-        RagBundle("base", Path("c"), Path("i"), "e", None, False),
-        RagBundle("tuned", Path("c"), Path("i"), "e", None, False),
+
+
+def test_full_additional_annotations_are_fallback_only() -> None:
+    primary = [_annotation("shared", ("1",)), _annotation("primary", ("2",))]
+    additional = [
+        _annotation("shared", ("1",)),
+        _annotation("additional", ("3",)),
     ]
 
-    deltas = _comparison_deltas(scores, bundles, variants, True)
+    merged = _merge_full_annotations(primary, additional)
 
-    values = deltas.set_index("comparison")["query_recall"].to_dict()
-    assert values["embedding_without_reranker"] == pytest.approx(0.2)
-    assert values["reranker_on_baseline"] == pytest.approx(0.1)
-    assert values["reranker_on_tuned"] == pytest.approx(0.2)
-    assert values["combined_vs_unchanged_baseline"] == pytest.approx(0.4)
+    assert set(merged) == {"shared", "primary", "additional"}
+    assert merged["shared"] is primary[0]
+
+
+def test_conflicting_full_annotations_fail() -> None:
+    with pytest.raises(ValueError, match="Conflicting Full"):
+        _merge_full_annotations(
+            [_annotation("shared", ("1",))],
+            [_annotation("shared", ("2",))],
+        )
+
+
+class _FakeReranker:
+    revision = "test"
+
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+        self.calls = []
+
+    def score(self, query, documents):
+        self.calls.append((query, len(documents)))
+        wanted = (
+            {"article-1", "article-2"}
+            if query == "Dialogue positive"
+            else {"article-2" if query == "Full fallback" else "article-1"}
+        )
+        return [1.0 if document in wanted else 0.0 for document in documents]
+
+
+class _EvaluationRetriever:
+    def retrieve_rules_with_details(self, hypothesis: str) -> RetrievalOutcome:
+        records = ()
+        if hypothesis in {"Dialogue positive", "Full primary"}:
+            records = (self._record(1, "1", "exact"),)
+        return RetrievalOutcome(records, records, False)
+
+    def retrieve_semantic_with_details(
+        self, hypothesis: str, *, top_k: int, final_top_k: int
+    ) -> RetrievalOutcome:
+        records = []
+        for rank in range(1, top_k + 1):
+            article = str(100 + rank)
+            if rank == 15:
+                article = "1"
+            if rank == 30:
+                article = "2"
+            records.append(self._record(rank, article, "faiss"))
+        values = tuple(records)
+        return RetrievalOutcome(values, values[:final_top_k], False)
+
+    @staticmethod
+    def _record(rank: int, article: str, method: str) -> RetrievalRecord:
+        return RetrievalRecord(
+            premise=f"article-{article}",
+            source=f"КоАП РФ: Статья {article}.",
+            method=method,
+            rank=rank,
+            score=float(rank) if method == "faiss" else None,
+            citation=Citation("КоАП РФ", article),
+            initial_rank=rank,
+        )
+
+
+def _write_workbooks(root: Path) -> None:
+    pd.DataFrame(
+        [
+            ["Dialogue positive", "КоАП РФ Статья 1", "gold"],
+            ["Dialogue positive", "КоАП РФ Статья 2", "gold"],
+            ["Dialogue zero", "", ""],
+            ["Workbook only", "КоАП РФ Статья 9", "gold"],
+        ]
+    ).to_excel(root / "RAG_DIALOGUE_test.xlsx", header=False, index=False)
+    pd.DataFrame(
+        [
+            ["Full primary", "КоАП РФ Статья 1", "gold"],
+            ["Full zero", "", ""],
+        ]
+    ).to_excel(root / "RAG_FULL_test.xlsx", header=False, index=False)
+    pd.DataFrame(
+        [
+            ["Full primary", "КоАП РФ Статья 1", "gold"],
+            ["Full fallback", "КоАП РФ Статья 2", "gold"],
+        ]
+    ).to_excel(root / "RAG_FULL_additional_test.xlsx", header=False, index=False)
+
+
+def _document_rows(directory: Path) -> list[dict]:
+    hypotheses = (
+        ["Dialogue positive", "Dialogue zero", "Dialogue missing"]
+        if directory.name == "Dialogue"
+        else ["Full primary", "Full fallback", "Full zero", "Full missing"]
+    )
+    return [
+        {
+            "document": f"{directory.name}.docx",
+            "sentence_index": index,
+            "hypothesis": hypothesis,
+            "normalized_hypothesis": hypothesis.casefold(),
+        }
+        for index, hypothesis in enumerate(hypotheses)
+    ]
+
+
+@pytest.mark.parametrize(("with_finetuned", "expected_rows"), [(False, 8), (True, 12)])
+def test_compact_rag_matrix_and_depth_boundaries(
+    monkeypatch, tmp_path: Path, with_finetuned: bool, expected_rows: int
+) -> None:
+    _write_workbooks(tmp_path)
+    monkeypatch.setattr(
+        "jura_hypersumm.rag.evaluation._document_hypotheses", _document_rows
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.rag.evaluation.load_rag_bundle",
+        lambda source: RagBundle(
+            str(source), Path("codex"), Path("index"), "encoder", None, False
+        ),
+    )
+    pretrained = _FakeReranker("pretrained")
+    finetuned = _FakeReranker("finetuned") if with_finetuned else None
+    output = tmp_path / "results"
+
+    with pytest.warns(UserWarning, match="missing from rag_tests"):
+        scores = run_rag_evaluation(
+            ["baseline", "tuned"],
+            rag_test_dir=tmp_path,
+            test_docx_dir=tmp_path,
+            results_dir=output,
+            retriever_factory=lambda bundle, device: _EvaluationRetriever(),
+            pretrained_reranker=pretrained,
+            finetuned_reranker=finetuned,
+        )
+
+    assert list(scores.columns) == list(SUMMARY_COLUMNS)
+    assert len(scores) == expected_rows
+    assert (
+        "baseline_embeddings__finetuned_reranker" in set(scores.variant)
+    ) is with_finetuned
+    assert set(zip(scores.candidate_top_k, scores.final_top_k)) == {
+        (20, 10),
+        (40, 20),
+    }
+    baseline_no = scores[scores.variant == "baseline_embeddings__no_reranker"].set_index(
+        "candidate_top_k"
+    )
+    assert baseline_no.loc[20, "dialogue_faiss_recall"] == 0
+    assert baseline_no.loc[40, "dialogue_faiss_recall"] == pytest.approx(0.5)
+    assert baseline_no.loc[20, "dialogue_rules_recall"] == pytest.approx(0.5)
+    assert baseline_no.loc[20, "dialogue_total_recall"] == pytest.approx(0.5)
+    assert baseline_no.loc[20, "full_rules_recall"] == pytest.approx(0.5)
+    pretrained_rows = scores[
+        scores.variant == "baseline_embeddings__pretrained_reranker"
+    ].set_index("candidate_top_k")
+    assert pretrained_rows.loc[20, "dialogue_faiss_recall"] == pytest.approx(0.5)
+    assert pretrained_rows.loc[40, "dialogue_faiss_recall"] == 1
+    assert pretrained_rows.loc[20, "full_faiss_recall"] == pytest.approx(0.5)
+    assert pretrained_rows.loc[40, "full_faiss_recall"] == 1
+    assert pretrained_rows.loc[20, "full_total_recall"] == pytest.approx(0.5)
+    assert pretrained_rows.loc[40, "full_total_recall"] == 1
+    assert pretrained.calls
+    assert all(candidate_count == 40 for _, candidate_count in pretrained.calls)
+
+    workbook = pd.ExcelFile(output / "rag_recall.xlsx")
+    assert workbook.sheet_names == ["recall", "missing_hypotheses"]
+    missing = pd.read_excel(workbook, sheet_name="missing_hypotheses")
+    assert set(missing.dataset) == {"DIALOGUE", "FULL"}
+    assert len(missing) == 2
+    assert pd.read_csv(output / "rag_recall.csv").shape == scores.shape

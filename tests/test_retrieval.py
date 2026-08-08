@@ -272,6 +272,35 @@ def test_exact_results_bypass_reranker_and_final_truncation() -> None:
     assert reranker.calls == []
 
 
+def test_rule_only_retrieval_never_falls_back_to_faiss() -> None:
+    retriever, vectorstore = _retriever()
+
+    resolved = retriever.retrieve_rules_with_details(
+        "п. 2 ч. 1 ст. 32.9 КоАП РФ"
+    )
+    unresolved = retriever.retrieve_rules_with_details(
+        "ч. 1 ст. 999 КоАП РФ"
+    )
+
+    assert [record.premise for record in resolved.results] == ["32.9/1/2"]
+    assert unresolved.results == ()
+    assert vectorstore.calls == []
+
+
+def test_semantic_only_retrieval_bypasses_an_available_exact_citation() -> None:
+    retriever, vectorstore = _retriever()
+
+    outcome = retriever.retrieve_semantic_with_details(
+        "ч. 1 ст. 32.9 КоАП РФ", top_k=3, final_top_k=2
+    )
+
+    assert vectorstore.calls == [("ч. 1 ст. 32.9 КоАП РФ", 3)]
+    assert len(outcome.candidates) == 3
+    assert len(outcome.results) == 2
+    assert {record.method for record in outcome.results} == {"faiss"}
+    assert outcome.results[0].detected_citations == ()
+
+
 @pytest.mark.parametrize(
     ("candidate_top_k", "final_top_k", "message"),
     [(0, 1, "positive"), (5, 0, "positive"), (5, 6, "cannot exceed")],

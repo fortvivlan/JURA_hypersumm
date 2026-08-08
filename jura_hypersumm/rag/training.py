@@ -19,7 +19,11 @@ from ..common import (
 from ..retrieval import ensure_rag_repository
 from .artifacts import write_rag_manifest
 from .data import convert_embedding_dataset, dataframe_sha256
-from .evaluation import run_rag_evaluation
+from .evaluation import (
+    DEFAULT_RETRIEVAL_DEPTHS,
+    _validate_retrieval_depths,
+    run_rag_evaluation,
+)
 from .indexing import build_faiss_index
 from .reranker_training import train_reranker
 from .reranking import CrossEncoderReranker
@@ -180,11 +184,13 @@ def run_rag_experiment(
     rag_dir: str | Path = "dms-rag",
     rag_revision: str = "main",
     rag_test_dir: str | Path = "rag_tests",
+    dialogue_workbook: str | Path | None = None,
+    full_workbook: str | Path | None = None,
+    full_additional_workbook: str | Path | None = None,
     test_docx_dir: str | Path = "test_docx",
     model_id: str = "ai-forever/sbert_large_nlu_ru",
     revision: str | None = DEFAULT_BERT_REVISION,
-    candidate_top_k: int = 20,
-    final_top_k: int = 20,
+    retrieval_depths: Sequence[tuple[int, int]] = DEFAULT_RETRIEVAL_DEPTHS,
     reranker_mode: str = "pretrained",
     reranker_model_id: str = DEFAULT_RERANKER_MODEL,
     reranker_revision: str | None = None,
@@ -193,15 +199,12 @@ def run_rag_experiment(
     artifact_root: str | Path = "local_artifacts/rag",
     results_root: str | Path = "local_results/rag",
 ):
-    """Train SBERT and optionally a reranker, then compare four RAG variants."""
+    """Train retrieval models and write the compact two-depth Recall matrix."""
     parameters = merge_parameters(DEFAULT_RAG_TRAINING_PARAMETERS, hyperparameters)
+    depths = _validate_retrieval_depths(retrieval_depths)
     normalized_reranker_mode = reranker_mode.strip().lower()
     if normalized_reranker_mode not in {"pretrained", "finetuned"}:
         raise ValueError("reranker_mode must be pretrained or finetuned")
-    if candidate_top_k <= 0 or final_top_k <= 0:
-        raise ValueError("candidate_top_k and final_top_k must be positive")
-    if final_top_k > candidate_top_k:
-        raise ValueError("final_top_k cannot exceed candidate_top_k")
     configure_reproducibility(
         int(parameters["seed"]), deterministic=bool(parameters["deterministic"])
     )
@@ -259,6 +262,7 @@ def run_rag_experiment(
     reranker_validation_metrics = None
     reranker_training_metrics = None
     reranker_history = None
+    finetuned_reranker_model = None
     if normalized_reranker_mode == "finetuned":
         reranker_model, reranker_validation_metrics, reranker_history, reranker_training_metrics = train_reranker(
             train,
@@ -270,8 +274,7 @@ def run_rag_experiment(
             output_dir=artifacts,
             parameters=parameters,
         )
-        evaluation_reranker_model = str(reranker_model)
-        evaluation_reranker_revision = None
+        finetuned_reranker_model = str(reranker_model)
         reranker_manifest = {
             "mode": "finetuned",
             "model": str(Path(reranker_model).resolve().relative_to(artifacts.resolve())),
@@ -291,8 +294,6 @@ def run_rag_experiment(
         except ModuleNotFoundError:
             pass
     else:
-        evaluation_reranker_model = reranker_model_id
-        evaluation_reranker_revision = resolved_reranker_revision
         manifest_reranker_model = reranker_model_id
         if reranker_local:
             resolved_local_reranker = Path(reranker_model_id).expanduser().resolve()
@@ -310,15 +311,29 @@ def run_rag_experiment(
             "trust_remote_code": trust_reranker_code,
             "max_length": parameters["reranker_max_length"],
         }
-    reranker = CrossEncoderReranker(
-        evaluation_reranker_model,
-        revision=evaluation_reranker_revision,
+    pretrained_reranker = CrossEncoderReranker(
+        reranker_model_id,
+        revision=resolved_reranker_revision,
         token=reranker_token,
         trust_remote_code=trust_reranker_code,
         device=str(parameters["reranker_device"]),
         precision=str(parameters["reranker_precision"]),
         batch_size=int(parameters["reranker_eval_batch_size"]),
         max_length=int(parameters["reranker_max_length"]),
+    )
+    finetuned_reranker = (
+        CrossEncoderReranker(
+            finetuned_reranker_model,
+            revision=None,
+            token=reranker_token,
+            trust_remote_code=trust_reranker_code,
+            device=str(parameters["reranker_device"]),
+            precision=str(parameters["reranker_precision"]),
+            batch_size=int(parameters["reranker_eval_batch_size"]),
+            max_length=int(parameters["reranker_max_length"]),
+        )
+        if finetuned_reranker_model is not None
+        else None
     )
     run_metadata = {
         "model_id": model_id,
@@ -335,8 +350,29 @@ def run_rag_experiment(
         "training_metrics": training_metrics,
         "training_history": history,
         "index": index_metadata,
-        "candidate_top_k": candidate_top_k,
-        "final_top_k": final_top_k,
+        "retrieval_depths": [
+            {"candidate_top_k": candidate, "final_top_k": final}
+            for candidate, final in depths
+        ],
+        "evaluated_rerankers": [
+            {
+                "mode": "pretrained",
+                "model": reranker_model_id,
+                "revision": resolved_reranker_revision,
+            },
+            *(
+                [
+                    {
+                        "mode": "finetuned",
+                        "model": finetuned_reranker_model,
+                        "base_model": reranker_model_id,
+                        "base_revision": resolved_reranker_revision,
+                    }
+                ]
+                if finetuned_reranker_model is not None
+                else []
+            ),
+        ],
         "reranker": reranker_manifest,
         "reranker_validation_metrics": reranker_validation_metrics,
         "reranker_training_metrics": reranker_training_metrics,
@@ -362,17 +398,20 @@ def run_rag_experiment(
             "chunk_size": parameters["chunk_size"],
             "chunk_overlap": parameters["chunk_overlap"],
             "seed": parameters["seed"],
+            "retrieval_depths": [list(value) for value in depths],
         },
         reranker=reranker_manifest,
     )
     return run_rag_evaluation(
         [rag_path, manifest],
         rag_test_dir=rag_test_dir,
+        dialogue_workbook=dialogue_workbook,
+        full_workbook=full_workbook,
+        full_additional_workbook=full_additional_workbook,
         test_docx_dir=test_docx_dir,
         results_dir=results,
         embedding_device=str(parameters["embedding_device"]),
-        candidate_top_k=candidate_top_k,
-        final_top_k=final_top_k,
-        reranker=reranker,
-        compare_reranking=True,
+        retrieval_depths=depths,
+        pretrained_reranker=pretrained_reranker,
+        finetuned_reranker=finetuned_reranker,
     )

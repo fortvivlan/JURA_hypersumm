@@ -539,20 +539,82 @@ class PremiseRetriever:
             for index, row in enumerate(unique.itertuples(index=False), start=1)
         ]
 
-    def retrieve_with_details(
+    @staticmethod
+    def _retrieval_depths(
+        top_k: int, final_top_k: int | None
+    ) -> tuple[int, int]:
+        candidate_top_k = int(top_k)
+        retained_top_k = (
+            candidate_top_k if final_top_k is None else int(final_top_k)
+        )
+        if candidate_top_k <= 0 or retained_top_k <= 0:
+            raise ValueError("top_k and final_top_k must be positive")
+        if retained_top_k > candidate_top_k:
+            raise ValueError("final_top_k cannot exceed top_k")
+        return candidate_top_k, retained_top_k
+
+    def _semantic_outcome(
+        self,
+        hypothesis: str,
+        *,
+        candidate_top_k: int,
+        retained_top_k: int,
+        detected_citations: tuple[Citation, ...] = (),
+    ) -> RetrievalOutcome:
+        matches = self._vectorstore.similarity_search_with_score(
+            hypothesis, k=candidate_top_k
+        )
+        fallback_citation = (
+            detected_citations[0]
+            if len(detected_citations) == 1
+            else Citation()
+        )
+        candidates = tuple(
+            RetrievalRecord(
+                premise=str(document.page_content),
+                source=str(document.metadata.get("source", "")),
+                method="faiss",
+                rank=index,
+                score=float(score),
+                citation=fallback_citation,
+                detected_citations=detected_citations,
+                unresolved_citations=detected_citations,
+                initial_rank=index,
+            )
+            for index, (document, score) in enumerate(matches, start=1)
+        )
+        if self._reranker is None:
+            return RetrievalOutcome(candidates, candidates[:retained_top_k], False)
+        from .rag.reranking import rerank_records
+
+        results = rerank_records(
+            hypothesis,
+            candidates,
+            self._reranker,
+            final_top_k=retained_top_k,
+        )
+        return RetrievalOutcome(candidates, results, True)
+
+    def retrieve_semantic_with_details(
         self,
         hypothesis: str,
         *,
         top_k: int = 20,
         final_top_k: int | None = None,
     ) -> RetrievalOutcome:
-        """Retrieve candidates and optionally rerank semantic fallback records."""
-        candidate_top_k = int(top_k)
-        retained_top_k = candidate_top_k if final_top_k is None else int(final_top_k)
-        if candidate_top_k <= 0 or retained_top_k <= 0:
-            raise ValueError("top_k and final_top_k must be positive")
-        if retained_top_k > candidate_top_k:
-            raise ValueError("final_top_k cannot exceed top_k")
+        """Retrieve through FAISS only, deliberately bypassing citation rules."""
+        candidate_top_k, retained_top_k = self._retrieval_depths(
+            top_k, final_top_k
+        )
+        return self._semantic_outcome(
+            hypothesis,
+            candidate_top_k=candidate_top_k,
+            retained_top_k=retained_top_k,
+        )
+
+    def _rule_outcome(
+        self, hypothesis: str
+    ) -> tuple[RetrievalOutcome, tuple[Citation, ...]]:
         citations = extract_citations(hypothesis, code_aliases=self._code_aliases)
         exact: list[RetrievalRecord] = []
         unresolved: list[Citation] = []
@@ -570,47 +632,43 @@ class PremiseRetriever:
                 exact.append(record)
         detected_tuple = tuple(citations)
         unresolved_tuple = tuple(unresolved)
-        if exact:
-            results = tuple(
-                replace(
-                    record,
-                    rank=rank,
-                    initial_rank=rank,
-                    detected_citations=detected_tuple,
-                    unresolved_citations=unresolved_tuple,
-                )
-                for rank, record in enumerate(exact, start=1)
-            )
-            return RetrievalOutcome(results, results, False)
-        matches = self._vectorstore.similarity_search_with_score(
-            hypothesis, k=candidate_top_k
-        )
-        fallback_citation = citations[0] if len(citations) == 1 else Citation()
-        candidates = tuple(
-            RetrievalRecord(
-                premise=str(document.page_content),
-                source=str(document.metadata.get("source", "")),
-                method="faiss",
-                rank=index,
-                score=float(score),
-                citation=fallback_citation,
+        results = tuple(
+            replace(
+                record,
+                rank=rank,
+                initial_rank=rank,
                 detected_citations=detected_tuple,
-                unresolved_citations=detected_tuple,
-                initial_rank=index,
+                unresolved_citations=unresolved_tuple,
             )
-            for index, (document, score) in enumerate(matches, start=1)
+            for rank, record in enumerate(exact, start=1)
         )
-        if self._reranker is None:
-            return RetrievalOutcome(candidates, candidates[:retained_top_k], False)
-        from .rag.reranking import rerank_records
+        return RetrievalOutcome(results, results, False), detected_tuple
 
-        results = rerank_records(
-            hypothesis,
-            candidates,
-            self._reranker,
-            final_top_k=retained_top_k,
+    def retrieve_rules_with_details(self, hypothesis: str) -> RetrievalOutcome:
+        """Run deterministic citation extraction and exact lookup without FAISS."""
+        outcome, _ = self._rule_outcome(hypothesis)
+        return outcome
+
+    def retrieve_with_details(
+        self,
+        hypothesis: str,
+        *,
+        top_k: int = 20,
+        final_top_k: int | None = None,
+    ) -> RetrievalOutcome:
+        """Retrieve candidates and optionally rerank semantic fallback records."""
+        candidate_top_k, retained_top_k = self._retrieval_depths(
+            top_k, final_top_k
         )
-        return RetrievalOutcome(candidates, results, True)
+        rule_outcome, detected_tuple = self._rule_outcome(hypothesis)
+        if rule_outcome.results:
+            return rule_outcome
+        return self._semantic_outcome(
+            hypothesis,
+            candidate_top_k=candidate_top_k,
+            retained_top_k=retained_top_k,
+            detected_citations=detected_tuple,
+        )
 
     def retrieve(
         self,
