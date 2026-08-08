@@ -375,6 +375,33 @@ fine-tuning it again:
 scores = run("ministral", "ternary", use_existing_model=True)
 ```
 
+For inference only, `run_lora_document_inference(...)` loads an existing adapter
+without training, validation, or `autotest` scoring. It recursively processes
+the configured `test_docx` directory with the current parsing, filtering, RAG,
+and prompting modules, then leaves one persistent prediction XLSX per document:
+
+```python
+from jura_hypersumm.lora import run_lora_document_inference
+
+prediction_dir = run_lora_document_inference(
+    "ministral",
+    "ternary",
+    rag_dir="dms-rag",
+    drive_root="local_artifacts",
+    test_docx_dir="test_docx",
+    results_dir="local_results/lora_test_docx_predictions",
+    hyperparameters={"document_batch_size": 8, "embedding_device": "cpu"},
+)
+```
+
+The workflow requires the saved adapter, `dms-rag/codex.csv`,
+`dms-rag/faiss_index/`, and the DOCX files. Quantization, precision, device map,
+document batch size, input length, generation length, retrieval depth, and
+embedding device can be overridden through `hyperparameters`. In Colab, install
+the GPU dependencies and mount or upload those artifacts explicitly before
+calling the same interface. `lora_local.ipynb` is the native-Windows thin
+wrapper for the saved Ministral ternary adapter.
+
 The adapter manifest must match the model ID, task, base-model revision,
 prompt, prompt-processing strategy, and current train/validation file hashes.
 A missing or incompatible adapter raises an error rather than silently
@@ -642,10 +669,15 @@ document.
 
 Document inference extracts the final `ПОСТАНОВИЛ` section, splits it with
 `razdel`, removes signatures and payment-detail sentences containing `судья`,
-`реквизит`, `ре...изит`, or `квитанци`, performs deterministic citation lookup
-before a maximum of 20 FAISS matches, and preserves the premise responsible for
-every contradiction. Deterministic lookup accepts abbreviated and full code
-names, both `п. … ч. … ст. …` and `ст. … ч. … п. …` orders, multiple citations,
+`реквизит`, `ре...изит`, `квитанци`, or standalone case-sensitive
+`БИК`, `ИНН`, `УИН`, `КБК`, `ОКТМО`, `л/с`, or `р/с`, as well as
+sentences containing only digits.
+The `Отд.` abbreviation is protected from sentence splitting so a bank-details
+sentence is filtered as a whole. The pipeline then performs deterministic
+citation lookup before a maximum of 20 FAISS matches, and preserves the premise
+responsible for every contradiction. Deterministic lookup accepts abbreviated
+and full code names, both `п. … ч. … ст. …` and `ст. … ч. … п. …` orders,
+multiple citations,
 and article lists/ranges. A cited part returns all of its points; an article-only
 reference that maps to several corpus rows falls back to FAISS. Detected and
 unresolved citations are retained in the audit sheets. A document without

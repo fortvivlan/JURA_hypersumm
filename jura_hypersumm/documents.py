@@ -15,6 +15,12 @@ IRRELEVANT_SENTENCE_MARKERS = (
     "квитанци",
     "судья",
 )
+BANK_DETAIL_PATTERN = re.compile(
+    r"(?<!\w)(?:БИК|ИНН|УИН|КБК|ОКТМО|л/с|р/с)(?!\w)"
+)
+NUMERIC_SENTENCE_PATTERN = re.compile(r"(?:\d+\s*)+[.!?]?")
+OTD_ABBREVIATION = "Отд."
+OTD_PLACEHOLDER = "Отд\ue000"
 
 
 def read_docx_text(path: str | Path) -> str:
@@ -39,13 +45,23 @@ def extract_operative_section(text: str) -> str | None:
 
 
 def split_russian_sentences(text: str) -> list[str]:
-    """Split nonempty Russian sentences with razdel."""
+    """Split sentences without treating the ``Отд.`` abbreviation as an ending."""
     from razdel import sentenize
 
-    return [sentence.text.strip() for sentence in sentenize(text) if sentence.text.strip()]
+    protected_text = text.replace(OTD_ABBREVIATION, OTD_PLACEHOLDER)
+    return [
+        sentence.text.replace(OTD_PLACEHOLDER, OTD_ABBREVIATION).strip()
+        for sentence in sentenize(protected_text)
+        if sentence.text.strip()
+    ]
 
 
 def textcheck(text: str) -> bool:
     """Return whether a sentence is irrelevant to codex contradiction checks."""
     normalized = text.lower()
-    return any(marker in normalized for marker in IRRELEVANT_SENTENCE_MARKERS)
+    return any(
+        marker in normalized for marker in IRRELEVANT_SENTENCE_MARKERS
+    ) or bool(
+        BANK_DETAIL_PATTERN.search(text)
+        or NUMERIC_SENTENCE_PATTERN.fullmatch(text.strip())
+    )

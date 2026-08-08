@@ -3,7 +3,10 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pandas as pd
-from jura_hypersumm.reporting import write_document_review_package
+from jura_hypersumm.reporting import (
+    write_document_review_package,
+    write_document_review_workbooks,
+)
 
 
 def test_document_review_package_contains_only_model_workbooks_with_articles(
@@ -144,3 +147,32 @@ def test_document_review_package_separates_multi_dataset_duplicate_names(
             "Dialogue/decision_ternary_model_predictions.xlsx",
             "Full/decision_ternary_model_predictions.xlsx",
         }
+
+
+def test_document_review_workbooks_remain_available_as_xlsx_files(
+    tmp_path: Path,
+) -> None:
+    pairs = pd.DataFrame(
+        [
+            {
+                "test_dataset": "Full",
+                "document": "decision.docx",
+                "task": "ternary",
+                "sentence_index": 0,
+                "hypothesis": "Sentence.",
+                "premise": "Premise.",
+                "source": "КоАП РФ: Статья 1.",
+                "retrieval_rank": 1,
+                "prediction": "not mentioned",
+            }
+        ]
+    )
+
+    directory = write_document_review_workbooks(
+        "lora", pairs, output_dir=tmp_path
+    )
+
+    assert directory is not None
+    workbook = directory / "Full" / "decision_ternary_model_predictions.xlsx"
+    assert workbook.is_file()
+    assert pd.read_excel(workbook).loc[0, "model_prediction"] == "not mentioned"

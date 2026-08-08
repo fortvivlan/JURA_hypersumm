@@ -87,6 +87,14 @@ def test_document_inference_filters_irrelevant_sentences_before_retrieval(
             "Оплатить по реквизитам.",
             "Банковские ре...изиты.",
             "Приложить квитанцию.",
+            "Банк получателя, БИК 044525000.",
+            "Получатель, ИНН 7700000000.",
+            "Номер начисления, УИН 18810177240010001111.",
+            "Код дохода, КБК 18811601181019000140.",
+            "Код территории, ОКТМО 45382000.",
+            "Лицевой счет, л/с 40100770005.",
+            "Расчетный счет, р/с 40101810045250010041.",
+            "40101810045250010041.",
             "Назначить административный штраф.",
         ],
     )
@@ -104,8 +112,8 @@ def test_document_inference_filters_irrelevant_sentences_before_retrieval(
 
     assert retriever.hypotheses == ["Назначить административный штраф."]
     assert set(tables.pairs["hypothesis"]) == {"Назначить административный штраф."}
-    assert set(tables.pairs["sentence_index"]) == {4}
-    assert set(tables.pairs["hypothesis_id"]) == {"decision.docx:00004"}
+    assert set(tables.pairs["sentence_index"]) == {12}
+    assert set(tables.pairs["hypothesis_id"]) == {"decision.docx:00012"}
 
 
 def test_missing_operative_section_is_reported_and_skipped(

@@ -133,6 +133,26 @@ def write_document_review_package(
     """
     if document_pairs is None or document_pairs.empty:
         return None
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = output_dir / (
+        f"{_safe_artifact_name(workflow_name)}_document_review_{timestamp}.zip"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="jura_review_", dir=output_dir
+    ) as temporary_directory:
+        _write_document_review_workbooks(document_pairs, Path(temporary_directory))
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for workbook in sorted(Path(temporary_directory).rglob("*.xlsx")):
+                archive.write(
+                    workbook, arcname=workbook.relative_to(temporary_directory)
+                )
+    return archive_path
+
+
+def _write_document_review_workbooks(document_pairs, target_dir: Path) -> list[Path]:
+    """Write review workbooks below an existing target directory."""
     required = {
         "document",
         "task",
@@ -148,66 +168,71 @@ def write_document_review_package(
         raise ValueError(
             "Document pair table lacks review-package columns: " + ", ".join(missing)
         )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dataset_aware = "test_dataset" in document_pairs.columns and any(
+        str(value) != "default"
+        for value in document_pairs["test_dataset"].dropna().unique()
+    )
+    grouping = ["document"]
+    sort_columns = ["document", "task", "sentence_index", "retrieval_rank"]
+    if dataset_aware:
+        grouping.insert(0, "test_dataset")
+        sort_columns.insert(0, "test_dataset")
+    ordered = document_pairs.sort_values(sort_columns, kind="stable")
+    workbooks: list[Path] = []
+    for group_key, document_rows in ordered.groupby(grouping, sort=False):
+        if dataset_aware:
+            dataset_name, document_name = group_key
+            dataset_directory = target_dir / _safe_artifact_name(str(dataset_name))
+            dataset_directory.mkdir(parents=True, exist_ok=True)
+        else:
+            document_name = group_key[0] if isinstance(group_key, tuple) else group_key
+            dataset_directory = target_dir
+        document_slug = _safe_artifact_name(Path(str(document_name)).stem)
+        for task, task_rows in document_rows.groupby("task", sort=False):
+            model_review = task_rows.loc[
+                :, ["hypothesis", "premise", "prediction"]
+            ].rename(columns={"prediction": "model_prediction"})
+            model_review.insert(
+                2,
+                "article_number",
+                [
+                    format_article_reference(
+                        row.source,
+                        getattr(row, "citation_code", None),
+                        getattr(row, "citation_article", None),
+                        getattr(row, "citation_part", None),
+                        getattr(row, "citation_point", None),
+                    )
+                    for row in task_rows.itertuples(index=False)
+                ],
+            )
+            model_review["expert_label"] = ""
+            model_review["expert_comment"] = ""
+            model_path = dataset_directory / (
+                f"{document_slug}_{_safe_artifact_name(str(task))}_model_predictions.xlsx"
+            )
+            model_review.to_excel(
+                model_path, sheet_name="model_predictions", index=False
+            )
+            workbooks.append(model_path)
+    return workbooks
 
+
+def write_document_review_workbooks(
+    workflow_name: str,
+    document_pairs,
+    *,
+    output_dir: str | Path = DEFAULT_RESULTS_DIR,
+) -> Path | None:
+    """Write persistent per-document prediction workbooks and return their directory."""
+    if document_pairs is None or document_pairs.empty:
+        return None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive_path = output_dir / f"{_safe_artifact_name(workflow_name)}_document_review_{timestamp}.zip"
-    with tempfile.TemporaryDirectory(
-        prefix="jura_review_", dir=output_dir
-    ) as temporary_directory:
-        temporary = Path(temporary_directory)
-        dataset_aware = "test_dataset" in document_pairs.columns and any(
-            str(value) != "default"
-            for value in document_pairs["test_dataset"].dropna().unique()
-        )
-        grouping = ["document"]
-        sort_columns = ["document", "task", "sentence_index", "retrieval_rank"]
-        if dataset_aware:
-            grouping.insert(0, "test_dataset")
-            sort_columns.insert(0, "test_dataset")
-        ordered = document_pairs.sort_values(
-            sort_columns,
-            kind="stable",
-        )
-        grouped = ordered.groupby(grouping, sort=False)
-        for group_key, document_rows in grouped:
-            if dataset_aware:
-                dataset_name, document_name = group_key
-                dataset_directory = temporary / _safe_artifact_name(str(dataset_name))
-                dataset_directory.mkdir(parents=True, exist_ok=True)
-            else:
-                document_name = group_key[0] if isinstance(group_key, tuple) else group_key
-                dataset_directory = temporary
-            document_slug = _safe_artifact_name(Path(str(document_name)).stem)
-            for task, task_rows in document_rows.groupby("task", sort=False):
-                model_review = task_rows.loc[
-                    :, ["hypothesis", "premise", "prediction"]
-                ].rename(columns={"prediction": "model_prediction"})
-                model_review.insert(
-                    2,
-                    "article_number",
-                    [
-                        format_article_reference(
-                            row.source,
-                            getattr(row, "citation_code", None),
-                            getattr(row, "citation_article", None),
-                            getattr(row, "citation_part", None),
-                            getattr(row, "citation_point", None),
-                        )
-                        for row in task_rows.itertuples(index=False)
-                    ],
-                )
-                model_review["expert_label"] = ""
-                model_review["expert_comment"] = ""
-                model_path = dataset_directory / (
-                    f"{document_slug}_{_safe_artifact_name(str(task))}_model_predictions.xlsx"
-                )
-                model_review.to_excel(
-                    model_path, sheet_name="model_predictions", index=False
-                )
-
-        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for workbook in sorted(temporary.rglob("*.xlsx")):
-                archive.write(workbook, arcname=workbook.relative_to(temporary))
-    return archive_path
+    target = output_dir / (
+        f"{_safe_artifact_name(workflow_name)}_document_predictions_{timestamp}"
+    )
+    _write_document_review_workbooks(document_pairs, target)
+    return target

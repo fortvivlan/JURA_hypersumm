@@ -53,6 +53,7 @@ from .prompting import (
 from .reporting import (
     display_scores,
     write_document_review_package,
+    write_document_review_workbooks,
     write_results_workbook,
 )
 from .retrieval import PremiseRetriever, ensure_rag_repository
@@ -378,6 +379,160 @@ def _load_saved_adapter(
     model.config.use_cache = True
     model.eval()
     return model, tokenizer, loaded.compute_dtype
+
+
+def _prediction_datasets(test_docx_dir: str | Path) -> list[tuple[str, tuple[Path, ...]]]:
+    """Group every DOCX below a test root by its relative directory."""
+    root = Path(test_docx_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Test DOCX directory does not exist: {root}")
+    grouped: dict[str, list[Path]] = {}
+    for document in sorted(root.rglob("*.docx"), key=lambda path: str(path).casefold()):
+        relative_parent = document.parent.relative_to(root)
+        dataset = relative_parent.as_posix() if relative_parent.parts else "root"
+        grouped.setdefault(dataset, []).append(document)
+    if not grouped:
+        raise FileNotFoundError(f"No DOCX files found below: {root}")
+    return [(name, tuple(paths)) for name, paths in grouped.items()]
+
+
+def run_lora_document_inference(
+    model_name: str,
+    task: str,
+    hyperparameters: Mapping[str, Any] | None = None,
+    *,
+    rag_dir: str | Path = DEFAULT_RAG_DIR,
+    rag_revision: str = DEFAULT_RAG_REVISION,
+    drive_root: str | Path = DEFAULT_DRIVE_ROOT,
+    revision: str | None = None,
+    test_docx_dir: str | Path = DEFAULT_TEST_DOCX_DIR,
+    results_dir: str | Path = DEFAULT_RESULTS_DIR,
+) -> Path:
+    """Load an existing LoRA adapter and write XLSX predictions for test DOCX files.
+
+    This inference-only workflow does not load training/validation datasets, train,
+    validate, or score against ``autotest``. Every ``.docx`` below
+    ``test_docx_dir`` is processed with the current parsing, filtering, retrieval,
+    and prompting code. The returned directory contains one persistent
+    ``model_predictions.xlsx`` workbook per document.
+    """
+    import pandas as pd
+
+    validated_task = validate_task(task)
+    spec = resolve_model(model_name)
+    workflow = f"lora-inference/{spec.alias}/{validated_task}"
+    announce_stage(workflow, "setup", "Loading the saved adapter configuration.")
+    artifact_root = prepare_artifact_root(drive_root)
+    adapter_target = (
+        artifact_root
+        / "models"
+        / "lora"
+        / slugify_model_id(spec.model_id)
+        / validated_task
+    )
+    manifest = load_saved_artifact_manifest(
+        adapter_target,
+        required_files=(
+            "run_config.json",
+            "adapter_config.json",
+            "tokenizer_config.json",
+        ),
+        weight_files=("adapter_model.safetensors", "adapter_model.bin"),
+        expected={
+            "model_id": spec.model_id,
+            "task": validated_task,
+            "prompt_sha256": prompt_sha256(prompt_for_task(validated_task)),
+            "prompt_processing": _prompt_processing_strategy(spec.alias),
+        },
+    )
+    stored_parameters = manifest.get("hyperparameters")
+    if not isinstance(stored_parameters, dict):
+        raise ValueError(
+            f"Saved LoRA manifest has no hyperparameters: {adapter_target}"
+        )
+    parameters = merge_parameters(DEFAULT_LORA_HYPERPARAMETERS, stored_parameters)
+    parameters = merge_parameters(parameters, hyperparameters)
+    configure_reproducibility(
+        int(parameters["seed"]),
+        deterministic=bool(parameters["deterministic"]),
+    )
+    effective_revision = saved_artifact_revision(manifest, adapter_target)
+    token = get_huggingface_token()
+    if revision is not None:
+        requested_revision = resolve_huggingface_revision(
+            spec.model_id, revision, token=token
+        )
+        if requested_revision != effective_revision:
+            raise ValueError(
+                "Requested base-model revision does not match the saved adapter: "
+                f"{requested_revision} != {effective_revision}"
+            )
+
+    datasets = _prediction_datasets(test_docx_dir)
+    announce_stage(workflow, "rag", "Preparing the pinned RAG repository.")
+    rag_path, rag_commit = ensure_rag_repository(rag_dir, revision=rag_revision)
+    announce_stage(workflow, "rag", f"RAG repository ready at {rag_commit[:12]}.")
+    model = tokenizer = None
+    try:
+        announce_stage(workflow, "load", "Loading the saved LoRA adapter.")
+        model, tokenizer, _ = _load_saved_adapter(
+            adapter_target,
+            spec=spec,
+            revision=effective_revision,
+            token=token,
+            parameters=parameters,
+        )
+        predictor = CausalPredictor(
+            model,
+            tokenizer,
+            validated_task,
+            batch_size=int(parameters["document_batch_size"]),
+            max_input_length=int(parameters["max_input_length"]),
+            max_new_tokens=int(parameters["max_new_tokens"]),
+        )
+        retriever = PremiseRetriever.from_rag_directory(
+            rag_path,
+            embedding_revision=str(parameters["embedding_revision"]),
+            embedding_device=str(parameters["embedding_device"]),
+        )
+        pair_tables = []
+        for dataset_name, documents in datasets:
+            announce_stage(
+                workflow,
+                "testing",
+                f"Predicting {len(documents)} document(s) from {dataset_name}.",
+            )
+            tables = run_document_inference(
+                documents,
+                predictor=predictor,
+                retriever=retriever,
+                model_id=spec.model_id,
+                task=validated_task,
+                top_k=int(parameters["retrieval_top_k"]),
+            )
+            pair_tables.append(add_test_dataset(tables.pairs, dataset_name))
+        document_pairs = pd.concat(pair_tables, ignore_index=True)
+        output = write_document_review_workbooks(
+            f"lora_{slugify_model_id(spec.model_id)}_{validated_task}",
+            document_pairs,
+            output_dir=results_dir,
+        )
+        if output is None:
+            raise RuntimeError("Document inference produced no prediction pairs")
+        announce_stage(workflow, "complete", f"Prediction workbooks saved to {output}.")
+        return output
+    finally:
+        if model is not None:
+            del model
+        if tokenizer is not None:
+            del tokenizer
+        gc.collect()
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except ModuleNotFoundError:
+            pass
 
 
 def run(
