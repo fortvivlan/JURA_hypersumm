@@ -34,6 +34,11 @@ class RagBundle:
     normalize_embeddings: bool
     manifest_path: Path | None = None
     reranker: RerankerBundle | None = None
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
+    embedding_trust_remote_code: bool = False
+    embedding_precision: str = "float32"
+    embedding_batch_size: int = 32
 
 
 def write_rag_manifest(
@@ -45,16 +50,21 @@ def write_rag_manifest(
     index_dir: str | Path,
     metadata: dict[str, Any],
     reranker: dict[str, Any] | None = None,
+    embedding_options: dict[str, Any] | None = None,
 ) -> Path:
     """Write a versioned manifest for a trained encoder/index pair."""
     root = Path(bundle_dir).resolve()
     codex = Path(codex_path).resolve()
     model = Path(embedding_model_dir).resolve()
     index = Path(index_dir).resolve()
+    try:
+        stored_codex_path = str(codex.relative_to(root))
+    except ValueError:
+        stored_codex_path = str(codex)
     manifest = {
         "schema_version": 1,
         "name": experiment_id,
-        "codex_path": str(codex),
+        "codex_path": stored_codex_path,
         "codex_sha256": file_sha256(codex),
         "embedding_model": str(model.relative_to(root)),
         "faiss_index": str(index.relative_to(root)),
@@ -62,6 +72,7 @@ def write_rag_manifest(
             name: file_sha256(index / name) for name in ("index.faiss", "index.pkl")
         },
         "normalize_embeddings": True,
+        "embedding_options": embedding_options or {},
         "reranker": reranker,
         **metadata,
     }
@@ -73,9 +84,16 @@ def write_rag_manifest(
     return target
 
 
-def load_rag_bundle(source: str | Path, *, name: str | None = None) -> RagBundle:
+def load_rag_bundle(
+    source: str | Path,
+    *,
+    name: str | None = None,
+    codex_override: str | Path | None = None,
+) -> RagBundle:
     """Resolve either a legacy dms-rag directory or a RAG manifest."""
     path = Path(source).expanduser().resolve()
+    if path.is_dir() and (path / "rag_manifest.json").is_file():
+        path = path / "rag_manifest.json"
     if path.is_dir():
         codex = path / "codex.csv"
         index = path / "faiss_index"
@@ -96,7 +114,11 @@ def load_rag_bundle(source: str | Path, *, name: str | None = None) -> RagBundle
     if value.get("schema_version") != 1:
         raise ValueError(f"Unsupported RAG manifest schema: {path}")
     root = path.parent
-    codex = Path(value["codex_path"])
+    if codex_override is not None:
+        codex = Path(codex_override).expanduser().resolve()
+    else:
+        stored_codex = Path(value["codex_path"])
+        codex = stored_codex if stored_codex.is_absolute() else root / stored_codex
     model = root / value["embedding_model"]
     index = root / value["faiss_index"]
     if file_sha256(codex) != value["codex_sha256"]:
@@ -124,6 +146,7 @@ def load_rag_bundle(source: str | Path, *, name: str | None = None) -> RagBundle
             trust_remote_code=bool(reranker_value.get("trust_remote_code", False)),
             max_length=int(reranker_value.get("max_length", 1024)),
         )
+    embedding_options = value.get("embedding_options") or {}
     return RagBundle(
         name=name or str(value["name"]),
         codex_path=codex,
@@ -133,4 +156,13 @@ def load_rag_bundle(source: str | Path, *, name: str | None = None) -> RagBundle
         normalize_embeddings=bool(value.get("normalize_embeddings", True)),
         manifest_path=path,
         reranker=reranker,
+        embedding_query_prefix=str(embedding_options.get("query_prefix", "")),
+        embedding_document_prefix=str(
+            embedding_options.get("document_prefix", "")
+        ),
+        embedding_trust_remote_code=bool(
+            embedding_options.get("trust_remote_code", False)
+        ),
+        embedding_precision=str(embedding_options.get("precision", "float32")),
+        embedding_batch_size=int(embedding_options.get("batch_size", 32)),
     )

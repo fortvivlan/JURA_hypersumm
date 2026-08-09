@@ -29,6 +29,14 @@ SUMMARY_COLUMNS = (
     "full_rules_recall",
     "full_total_recall",
 )
+EVALUATION_VARIANTS = (
+    "baseline_embeddings__no_reranker",
+    "baseline_embeddings__pretrained_reranker",
+    "tuned_embeddings__no_reranker",
+    "tuned_embeddings__pretrained_reranker",
+    "baseline_embeddings__finetuned_reranker",
+    "tuned_embeddings__finetuned_reranker",
+)
 MISSING_COLUMNS = (
     "dataset",
     "document",
@@ -236,6 +244,11 @@ def _make_retriever(bundle: RagBundle, device: str) -> PremiseRetriever:
         embedding_revision=bundle.embedding_revision,
         embedding_device=device,
         normalize_embeddings=bundle.normalize_embeddings,
+        embedding_query_prefix=bundle.embedding_query_prefix,
+        embedding_document_prefix=bundle.embedding_document_prefix,
+        embedding_trust_remote_code=bundle.embedding_trust_remote_code,
+        embedding_precision=bundle.embedding_precision,
+        embedding_batch_size=bundle.embedding_batch_size,
     )
 
 
@@ -244,8 +257,46 @@ def _resolve_workbook(value: str | Path | None, root: Path, default: str) -> Pat
     return path if path.is_absolute() else path.resolve()
 
 
+def _select_variant_definitions(
+    requested: Sequence[str] | None,
+    *,
+    pretrained_reranker: Reranker | None,
+    finetuned_reranker: Reranker | None,
+) -> list[tuple[str, int, str | None]]:
+    definitions = {
+        "baseline_embeddings__no_reranker": (0, None),
+        "baseline_embeddings__pretrained_reranker": (0, "pretrained_reranker"),
+        "tuned_embeddings__no_reranker": (1, None),
+        "tuned_embeddings__pretrained_reranker": (1, "pretrained_reranker"),
+        "baseline_embeddings__finetuned_reranker": (0, "finetuned_reranker"),
+        "tuned_embeddings__finetuned_reranker": (1, "finetuned_reranker"),
+    }
+    if requested is None:
+        if pretrained_reranker is None:
+            raise ValueError("pretrained_reranker is required for full RAG comparison")
+        names = list(EVALUATION_VARIANTS[:4])
+        if finetuned_reranker is not None:
+            names.extend(EVALUATION_VARIANTS[4:])
+    else:
+        names = [str(value) for value in requested]
+        if not names:
+            raise ValueError("evaluation_variants cannot be empty")
+        if len(set(names)) != len(names):
+            raise ValueError("evaluation_variants cannot contain duplicates")
+        unknown = [name for name in names if name not in definitions]
+        if unknown:
+            raise ValueError(f"Unknown RAG evaluation variants: {unknown}")
+    if any("pretrained_reranker" in name for name in names):
+        if pretrained_reranker is None:
+            raise ValueError("A selected variant requires pretrained_reranker")
+    if any("finetuned_reranker" in name for name in names):
+        if finetuned_reranker is None:
+            raise ValueError("A selected variant requires finetuned_reranker")
+    return [(name, *definitions[name]) for name in names]
+
+
 def run_rag_evaluation(
-    rag_sources: Sequence[str | Path],
+    rag_sources: Sequence[str | Path | RagBundle],
     *,
     rag_test_dir: str | Path = "rag_tests",
     dialogue_workbook: str | Path | None = None,
@@ -258,14 +309,16 @@ def run_rag_evaluation(
     retrieval_depths: Sequence[tuple[int, int]] = DEFAULT_RETRIEVAL_DEPTHS,
     pretrained_reranker: Reranker | None = None,
     finetuned_reranker: Reranker | None = None,
+    evaluation_variants: Sequence[str] | None = None,
 ):
-    """Write six compact Recall values for every embedding/reranker/depth variant."""
+    """Write method-conditional and total Recall for each retrieval variant."""
     import pandas as pd
 
     depths = _validate_retrieval_depths(retrieval_depths)
-    if pretrained_reranker is None:
-        raise ValueError("pretrained_reranker is required for RAG comparison")
-    bundles = [load_rag_bundle(source) for source in rag_sources]
+    bundles = [
+        source if isinstance(source, RagBundle) else load_rag_bundle(source)
+        for source in rag_sources
+    ]
     if len(bundles) != 2:
         raise ValueError("rag_sources must contain baseline and tuned RAG versions")
 
@@ -304,27 +357,11 @@ def run_rag_evaluation(
         "pretrained_reranker": pretrained_reranker,
         "finetuned_reranker": finetuned_reranker,
     }
-    variant_definitions = [
-        ("baseline_embeddings__no_reranker", 0, None),
-        ("baseline_embeddings__pretrained_reranker", 0, "pretrained_reranker"),
-        ("tuned_embeddings__no_reranker", 1, None),
-        ("tuned_embeddings__pretrained_reranker", 1, "pretrained_reranker"),
-    ]
-    if finetuned_reranker is not None:
-        variant_definitions.extend(
-            [
-                (
-                    "baseline_embeddings__finetuned_reranker",
-                    0,
-                    "finetuned_reranker",
-                ),
-                (
-                    "tuned_embeddings__finetuned_reranker",
-                    1,
-                    "finetuned_reranker",
-                ),
-            ]
-        )
+    variant_definitions = _select_variant_definitions(
+        evaluation_variants,
+        pretrained_reranker=pretrained_reranker,
+        finetuned_reranker=finetuned_reranker,
+    )
 
     counters: dict[tuple[str, int, int, str, str], list[int]] = defaultdict(
         lambda: [0, 0]
@@ -332,12 +369,14 @@ def run_rag_evaluation(
     make_retriever = retriever_factory or _make_retriever
     maximum_candidates = max(candidate for candidate, _ in depths)
     for bundle_index, bundle in enumerate(bundles):
-        retriever = make_retriever(bundle, embedding_device)
         bundle_variants = [
             definition
             for definition in variant_definitions
             if definition[1] == bundle_index
         ]
+        if not bundle_variants:
+            continue
+        retriever = make_retriever(bundle, embedding_device)
         for dataset_name, rows in datasets.items():
             for row in rows:
                 gold_keys = {
@@ -348,31 +387,38 @@ def run_rag_evaluation(
                 rules = retriever.retrieve_rules_with_details(
                     row["hypothesis"]
                 ).results
-                semantic = retriever.retrieve_semantic_with_details(
-                    row["hypothesis"],
-                    top_k=maximum_candidates,
-                    final_top_k=maximum_candidates,
-                ).candidates
-                ranked_by_reranker = {
-                    key: score_and_sort_records(row["hypothesis"], semantic, model)
-                    for key, model in rerankers.items()
-                    if model is not None
-                }
-                for variant, _, reranker_key in bundle_variants:
-                    semantic_ranking = (
-                        semantic
-                        if reranker_key is None
-                        else ranked_by_reranker[reranker_key]
-                    )
-                    for candidate_top_k, final_top_k in depths:
-                        faiss_records = _records_for_depth(
-                            semantic_ranking, candidate_top_k, final_top_k
+                semantic = ()
+                ranked_by_reranker = {}
+                if not rules:
+                    semantic = retriever.retrieve_semantic_with_details(
+                        row["hypothesis"],
+                        top_k=maximum_candidates,
+                        final_top_k=maximum_candidates,
+                    ).candidates
+                    ranked_by_reranker = {
+                        key: score_and_sort_records(
+                            row["hypothesis"], semantic, model
                         )
-                        system_records = {
-                            "faiss": faiss_records,
-                            "rules": rules,
-                            "total": rules if rules else faiss_records,
-                        }
+                        for key, model in rerankers.items()
+                        if model is not None
+                    }
+                for variant, _, reranker_key in bundle_variants:
+                    for candidate_top_k, final_top_k in depths:
+                        if rules:
+                            system_records = {"rules": rules, "total": rules}
+                        else:
+                            semantic_ranking = (
+                                semantic
+                                if reranker_key is None
+                                else ranked_by_reranker[reranker_key]
+                            )
+                            faiss_records = _records_for_depth(
+                                semantic_ranking, candidate_top_k, final_top_k
+                            )
+                            system_records = {
+                                "faiss": faiss_records,
+                                "total": faiss_records,
+                            }
                         for system, records in system_records.items():
                             retrieved = _retrieved_keys(records)
                             counter = counters[

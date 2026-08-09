@@ -221,6 +221,7 @@ AGENTS.md
 
 # JURA runtime artifacts (datasets and source CSVs remain trackable)
 /dms-rag/
+/rag-qwen/
 /faiss_index/
 /jura_lora_trainer/
 /jura_results/

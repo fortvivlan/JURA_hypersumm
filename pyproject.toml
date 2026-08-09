@@ -51,6 +51,9 @@ py-modules = [
     "run_lora_rank_local",
     "run_lora_target_modules_local",
     "run_lora_vs_llm_comparison_local",
+    "run_citation_audit_local",
+    "run_rag_depth_sweep_local",
+    "run_rag_embedding_sweep_local",
     "run_rag_experiment_local",
     "run_full_pipeline_evaluation_local",
 ]

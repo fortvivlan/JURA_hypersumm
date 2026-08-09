@@ -17,7 +17,7 @@ from ..common import (
     resolve_huggingface_revision,
 )
 from ..retrieval import ensure_rag_repository
-from .artifacts import write_rag_manifest
+from .artifacts import load_rag_bundle, write_rag_manifest
 from .data import convert_embedding_dataset, dataframe_sha256
 from .evaluation import (
     DEFAULT_RETRIEVAL_DEPTHS,
@@ -62,6 +62,66 @@ DEFAULT_RAG_TRAINING_PARAMETERS: dict[str, Any] = {
     "reranker_gradient_checkpointing": True,
     "reranker_device": "cuda",
 }
+
+
+def _completed_run_configuration(
+    artifacts: Path, reranker_mode: str
+) -> tuple[Path, dict[str, Any]] | None:
+    """Return completed experiment metadata when requested models are present."""
+    manifest = artifacts / "rag_manifest.json"
+    config_path = artifacts / "run_config.json"
+    if not manifest.is_file() or not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    if reranker_mode == "finetuned":
+        reranker = manifest_value.get("reranker") or {}
+        if reranker.get("mode") != "finetuned" or not reranker.get("local"):
+            return None
+    return manifest, config
+
+
+def _make_evaluation_rerankers(
+    *,
+    reranker_model_id: str,
+    reranker_revision: str | None,
+    reranker_trust_remote_code: bool | None,
+    finetuned_model: str | None,
+    parameters: Mapping[str, Any],
+):
+    token = get_huggingface_token()
+    local = Path(reranker_model_id).expanduser().exists()
+    resolved_revision = (
+        None
+        if local
+        else resolve_huggingface_revision(
+            reranker_model_id, reranker_revision, token=token
+        )
+    )
+    trust_remote_code = (
+        reranker_model_id == DEFAULT_RERANKER_MODEL
+        if reranker_trust_remote_code is None
+        else bool(reranker_trust_remote_code)
+    )
+    common = {
+        "token": token,
+        "trust_remote_code": trust_remote_code,
+        "device": str(parameters["reranker_device"]),
+        "precision": str(parameters["reranker_precision"]),
+        "batch_size": int(parameters["reranker_eval_batch_size"]),
+        "max_length": int(parameters["reranker_max_length"]),
+    }
+    pretrained = CrossEncoderReranker(
+        reranker_model_id,
+        revision=resolved_revision,
+        **common,
+    )
+    finetuned = (
+        CrossEncoderReranker(finetuned_model, revision=None, **common)
+        if finetuned_model is not None
+        else None
+    )
+    return pretrained, finetuned, resolved_revision, trust_remote_code, local, token
 
 
 def _train_encoder(train_frame, validation_frame, *, model_id: str, revision: str, output_dir: Path, parameters):
@@ -199,7 +259,7 @@ def run_rag_experiment(
     artifact_root: str | Path = "local_artifacts/rag",
     results_root: str | Path = "local_results/rag",
 ):
-    """Train retrieval models and write the compact two-depth Recall matrix."""
+    """Train missing retrieval models or reevaluate a completed experiment."""
     parameters = merge_parameters(DEFAULT_RAG_TRAINING_PARAMETERS, hyperparameters)
     depths = _validate_retrieval_depths(retrieval_depths)
     normalized_reranker_mode = reranker_mode.strip().lower()
@@ -212,6 +272,58 @@ def run_rag_experiment(
     results = Path(results_root) / experiment_id
     artifacts.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
+    completed = _completed_run_configuration(artifacts, normalized_reranker_mode)
+    if completed is not None:
+        manifest, stored_config = completed
+        stored_model = str(stored_config.get("model_id", ""))
+        if stored_model != model_id:
+            raise ValueError(
+                f"Completed experiment uses model {stored_model!r}, not {model_id!r}"
+            )
+        if normalized_reranker_mode == "finetuned":
+            stored_base = str(
+                (stored_config.get("reranker") or {}).get("base_model_id", "")
+            )
+            if stored_base and stored_base != reranker_model_id:
+                raise ValueError(
+                    "Completed experiment uses reranker base model "
+                    f"{stored_base!r}, not {reranker_model_id!r}"
+                )
+        stored_rag_commit = str(stored_config.get("rag_commit", ""))
+        if not stored_rag_commit:
+            raise ValueError("Completed experiment lacks its pinned rag_commit")
+        rag_path, _ = ensure_rag_repository(rag_dir, revision=stored_rag_commit)
+        bundle = load_rag_bundle(manifest)
+        finetuned_model = (
+            bundle.reranker.model
+            if normalized_reranker_mode == "finetuned"
+            and bundle.reranker is not None
+            else None
+        )
+        pretrained_reranker, finetuned_reranker, *_ = _make_evaluation_rerankers(
+            reranker_model_id=reranker_model_id,
+            reranker_revision=reranker_revision,
+            reranker_trust_remote_code=reranker_trust_remote_code,
+            finetuned_model=finetuned_model,
+            parameters=parameters,
+        )
+        print(
+            f"Complete artifacts found in {artifacts}; skipping training and "
+            "index rebuilding, and recalculating Recall only."
+        )
+        return run_rag_evaluation(
+            [rag_path, manifest],
+            rag_test_dir=rag_test_dir,
+            dialogue_workbook=dialogue_workbook,
+            full_workbook=full_workbook,
+            full_additional_workbook=full_additional_workbook,
+            test_docx_dir=test_docx_dir,
+            results_dir=results,
+            embedding_device=str(parameters["embedding_device"]),
+            retrieval_depths=depths,
+            pretrained_reranker=pretrained_reranker,
+            finetuned_reranker=finetuned_reranker,
+        )
     train = convert_embedding_dataset(train_path, "train")
     validation = convert_embedding_dataset(val_path, "validation")
     train.to_csv(results / "train_embedding.csv", index=False, encoding="utf-8")

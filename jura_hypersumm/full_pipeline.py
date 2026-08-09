@@ -361,6 +361,11 @@ def run_full_pipeline_evaluation(
         embedding_revision=bundle.embedding_revision,
         embedding_device=str(parameters["embedding_device"]),
         normalize_embeddings=bundle.normalize_embeddings,
+        embedding_query_prefix=bundle.embedding_query_prefix,
+        embedding_document_prefix=bundle.embedding_document_prefix,
+        embedding_trust_remote_code=bundle.embedding_trust_remote_code,
+        embedding_precision=bundle.embedding_precision,
+        embedding_batch_size=bundle.embedding_batch_size,
         reranker=reranker,
     )
     score_frames = []

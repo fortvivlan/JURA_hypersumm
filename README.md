@@ -71,10 +71,22 @@ full inference, then aligns it to the corresponding workbook:
 - Zero-article hypotheses and workbook-only hypotheses do not enter Recall.
 
 The first sheet contains one row per embedding/reranker/depth combination and
-exactly six article-level micro Recall values: FAISS-only, rules-only, and the
-production rule-first-with-FAISS-fallback system for Dialogue and Full. The
-second sheet contains only missing DOCX hypotheses. Pretrained mode writes
-eight rows (four variants at two depths); fine-tuned mode writes twelve.
+exactly six article-level micro Recall values for Dialogue and Full. Their
+denominators follow production routing: rules-only Recall uses only hypotheses
+where deterministic lookup returned at least one premise, while FAISS-only
+Recall uses only hypotheses that fell back to semantic retrieval. Total Recall
+uses every annotated hypothesis and selects rules when available, otherwise
+FAISS. A detected but unresolved citation belongs to the FAISS subset because
+that is the path used by inference. The second sheet contains only missing DOCX
+hypotheses. Pretrained mode writes eight rows (four variants at two depths);
+fine-tuned mode writes twelve.
+
+Rerunning an experiment ID with a complete `rag_manifest.json`,
+`run_config.json`, embedding model/index, and requested fine-tuned reranker
+reuses those artifacts. The stored RAG commit is restored and only Recall is
+recalculated, so updated DOCX annotations or retrieval depths do not trigger
+encoder/reranker fine-tuning or FAISS rebuilding. Use a new experiment ID when
+training settings or model identities should change.
 
 The Python interface accepts all important memory and reproducibility knobs:
 
@@ -105,10 +117,206 @@ scores = run_rag_experiment(
 )
 ```
 
+### Stage-two top-k sweep
+
+`run_rag_depth_sweep_local.py` exposes `run_rag_depth_sweep(...)`, a focused
+evaluation-only workflow for the selected baseline-embedding/fine-tuned-
+reranker variant. It uses the saved reranker from `sbert_legal_60` for `80:60`,
+the reranker from `sbert_legal_40` for `60:40`, and `sbert_legal_v1` for
+`100:80`, `40:20`, `20:10`, `100:60`, `100:40`, `100:20`, and `100:10`.
+All three manifests must agree on corpus, embedding, and reranker base
+revisions. No training dataset is loaded, no model is fine-tuned, and no FAISS
+index is rebuilt.
+
+The workflow requires the existing three artifact folders, `dms-rag/codex.csv`
+and `faiss_index/`, the RAG annotation workbooks, the paired test DOCX folders,
+and the optional GPU dependencies. Run the predefined matrix locally with:
+
+```powershell
+uv sync --extra colab --dev
+uv run python run_rag_depth_sweep_local.py
+```
+
+The equivalent Python/Colab interface is:
+
+```python
+from jura_hypersumm.rag import run_rag_depth_sweep
+
+report = run_rag_depth_sweep(
+    artifact_root="/content/JURA_hypersumm/local_artifacts/rag",
+    rag_dir="/content/dms-rag",
+    rag_test_dir="/content/JURA_hypersumm/rag_tests",
+    test_docx_dir="/content/JURA_hypersumm/test_docx",
+    results_dir="/content/results/top_k_stage2",
+    embedding_device="cuda",
+    reranker_device="cuda",
+    reranker_precision="auto",
+    reranker_batch_size=16,
+)
+```
+
+The workflow loads one local reranker at a time and releases GPU memory between
+artifact groups. Combined CSV/XLSX results and `evaluation_config.json` are
+written below `local_results/rag/sbert_legal_v1/top_k_stage2/`; per-artifact
+subreports remain available below `by_artifact/`. Rows preserve the requested
+depth order and record the artifact run, dense Full total-Recall rank, and tied
+best status. Existing first-stage results are not modified. Reduce reranker
+batch size or select `float16`/`bfloat16` explicitly when GPU memory is tight.
+
 For Colab, clone this repository and `dms-rag`, install `.[colab]`, then copy
 or mount the private XLSX/DOCX inputs explicitly before calling the same
 interface. The module does not mount Drive, upload files, install packages, or
 read Colab secrets at import time.
+
+### Stage-three embedding-model sweep
+
+`run_rag_embedding_sweep_local.py` exposes
+`run_rag_embedding_sweep(...)`. It keeps the winning stage-two configuration
+fixed—the original SBERT baseline, the fine-tuned reranker saved in
+`local_artifacts/rag/sbert_legal_v1`, and candidate/final depth `100:60`—and
+changes only the pretrained model used to build the FAISS candidate pool.
+Deterministic citation matches still bypass semantic retrieval and reranking.
+
+The default candidates are:
+
+- [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3), using plain query and
+  document text;
+- [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B),
+  using its instruction-aware query format;
+- [`intfloat/multilingual-e5-large-instruct`](https://huggingface.co/intfloat/multilingual-e5-large-instruct),
+  using its required retrieval instruction on queries only.
+
+All three are sentence-embedding models with Russian/multilingual retrieval
+support. Corpus chunks remain unprefixed, while Qwen and E5 queries receive the
+same English task description for retrieving Russian legal provisions. Jina
+Embeddings v3 is not a default because its checkpoint has a non-commercial
+license, and the much larger GigaEmbeddings checkpoint is outside this local
+comparison's intended memory profile.
+
+The inputs are the existing winner manifest and reranker, `dms-rag/codex.csv`,
+the RAG annotation workbooks, and `test_docx/{Dialogue,Full}`. Install the GPU
+dependencies and run all three models locally with:
+
+```powershell
+uv sync --extra colab --dev
+uv run python run_rag_embedding_sweep_local.py `
+  --embedding-device cuda `
+  --embedding-precision auto `
+  --embedding-batch-size 16 `
+  --reranker-device cuda `
+  --reranker-batch-size 16
+```
+
+Use repeatable `--model` arguments to run a subset, for example
+`--model bge_m3 --model qwen3_embedding_0_6b`. A custom plain-text embedding
+model can be supplied as `--model my_alias=owner/model`; models requiring a
+special prompt should instead be passed as `EmbeddingModelSpec` through the
+Python interface.
+
+Each resolved model revision, saved checkpoint, run configuration, and matching
+FAISS index is written under `local_artifacts/rag/embedding_stage3/<alias>/`.
+Combined CSV/XLSX Recall, improvement over SBERT, Full Recall ranks, an
+evaluation manifest, and per-model reports are written under
+`local_results/rag/embedding_stage3/`. Matching completed artifacts are reused;
+incompatible or partial artifacts fail explicitly. Plan for several gigabytes
+of model artifacts plus the Hugging Face download cache.
+
+The Python interface exposes the important resource knobs:
+
+```python
+from jura_hypersumm.rag import run_rag_embedding_sweep
+
+report = run_rag_embedding_sweep(
+    winner_manifest="local_artifacts/rag/sbert_legal_v1/rag_manifest.json",
+    rag_dir="dms-rag",
+    rag_test_dir="rag_tests",
+    test_docx_dir="test_docx",
+    embedding_device="cuda",
+    embedding_precision="auto",
+    embedding_batch_size=8,
+    reranker_device="cuda",
+    reranker_precision="auto",
+    reranker_batch_size=8,
+)
+print(report)
+```
+
+For Colab, mount or upload every private input explicitly before calling the
+same interface; the module does not access Drive or install packages itself:
+
+```python
+from google.colab import drive
+
+drive.mount("/content/drive")
+%cd /content/JURA_hypersumm
+%pip install -e ".[colab]"
+
+from jura_hypersumm.rag import run_rag_embedding_sweep
+
+report = run_rag_embedding_sweep(
+    winner_manifest="/content/drive/MyDrive/jura/rag/sbert_legal_v1/rag_manifest.json",
+    artifact_root="/content/drive/MyDrive/jura/rag/embedding_stage3",
+    rag_dir="/content/dms-rag",
+    rag_test_dir="/content/drive/MyDrive/jura/rag_tests",
+    test_docx_dir="/content/drive/MyDrive/jura/test_docx",
+    results_dir="/content/drive/MyDrive/jura/results/embedding_stage3",
+    embedding_batch_size=8,
+    reranker_batch_size=8,
+)
+```
+
+## Rule-based citation audit
+
+`run_citation_audit_local.py` exposes `run_citation_audit(...)`, a CPU-only
+workflow for diagnosing deterministic citation Recall. It applies the same
+`ПОСТАНОВИЛ` extraction, sentence splitting, and filtration as full inference,
+then compares detected citations and exact `codex.csv` matches with the expert
+references in the three `rag_tests` workbooks. It reports article-level
+`(code, article)` matches separately from complete references that also include
+part and point.
+
+The base project dependencies are sufficient; no embedding model, FAISS index,
+reranker, GPU, or quantization is used. Required inputs are `dms-rag/codex.csv`,
+`test_docx/{Dialogue,Full}`, and the three RAG annotation workbooks. Run it
+locally with:
+
+```powershell
+uv run python run_citation_audit_local.py
+```
+
+To diagnose only the hypotheses where deterministic lookup returned at least
+one premise and therefore prevented FAISS fallback, use:
+
+```powershell
+uv run python run_citation_audit_local.py --routing-scope rules
+```
+
+Within this rules-only report, `missed_expert` rows identify partial rule
+failures: the rules resolved something for the hypothesis, but omitted another
+expert-relevant article. `--routing-scope faiss` audits the complementary
+fallback subset, while `all` remains the default.
+
+The Python interface is equally suitable for Colab after explicitly cloning or
+mounting those inputs:
+
+```python
+from jura_hypersumm.rag import run_citation_audit
+
+report = run_citation_audit(
+    codex_path="/content/dms-rag/codex.csv",
+    rag_test_dir="/content/JURA_hypersumm/rag_tests",
+    test_docx_dir="/content/JURA_hypersumm/test_docx",
+    results_dir="/content/citation_audit",
+    routing_scope="rules",
+)
+print(report)
+```
+
+By default, the function returns a timestamped XLSX below
+`local_results/rag/citation_audit/`. Its sheets contain aggregate Recall,
+one row per pipeline hypothesis, one row per compared article, and hypotheses
+missing from expert workbooks. Missing annotations are retained for inspection
+but excluded from Recall. Existing output files are never overwritten.
 
 ## Inference-only full-pipeline evaluation
 
@@ -126,6 +334,27 @@ uv run python run_full_pipeline_evaluation_local.py `
   --rag-source dms-rag `
   --prompt-set base
 ```
+
+The selected production candidate is packaged locally in the self-contained
+`rag-qwen/` folder: Qwen3-Embedding-0.6B, its matching FAISS index and corpus,
+and the fine-tuned GTE reranker. It achieved Full total Recall
+`0.8990825688` at the winning `100:60` depth. Run the full pipeline with the
+directory itself as the RAG source:
+
+```powershell
+uv run python run_full_pipeline_evaluation_local.py `
+  --models-source local_artifacts/campaigns/full_pipeline_v1 `
+  --rag-source rag-qwen `
+  --reranker-mode bundle `
+  --candidate-top-k 100 `
+  --final-top-k 60 `
+  --embedding-device cuda `
+  --reranker-device cuda
+```
+
+The folder is intentionally ignored by Git because it contains model weights,
+the corpus, and generated FAISS artifacts. Its manifest uses relative paths and
+hashes, so the whole folder can be moved or mounted elsewhere unchanged.
 
 Use a tuned RAG by passing its manifest:
 

@@ -1,11 +1,14 @@
 import argparse
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from jura_hypersumm.rag.artifacts import RagBundle
 from jura_hypersumm.rag.data import convert_embedding_dataset
+from jura_hypersumm.rag import training as rag_training
 from jura_hypersumm.rag.evaluation import (
     SUMMARY_COLUMNS,
     _merge_full_annotations,
@@ -127,11 +130,7 @@ class _FakeReranker:
 
     def score(self, query, documents):
         self.calls.append((query, len(documents)))
-        wanted = (
-            {"article-1", "article-2"}
-            if query == "Dialogue positive"
-            else {"article-2" if query == "Full fallback" else "article-1"}
-        )
+        wanted = {"article-2" if query == "Full fallback" else "article-1"}
         return [1.0 if document in wanted else 0.0 for document in documents]
 
 
@@ -174,6 +173,7 @@ def _write_workbooks(root: Path) -> None:
         [
             ["Dialogue positive", "КоАП РФ Статья 1", "gold"],
             ["Dialogue positive", "КоАП РФ Статья 2", "gold"],
+            ["Dialogue fallback", "КоАП РФ Статья 1", "gold"],
             ["Dialogue zero", "", ""],
             ["Workbook only", "КоАП РФ Статья 9", "gold"],
         ]
@@ -194,7 +194,12 @@ def _write_workbooks(root: Path) -> None:
 
 def _document_rows(directory: Path) -> list[dict]:
     hypotheses = (
-        ["Dialogue positive", "Dialogue zero", "Dialogue missing"]
+        [
+            "Dialogue positive",
+            "Dialogue fallback",
+            "Dialogue zero",
+            "Dialogue missing",
+        ]
         if directory.name == "Dialogue"
         else ["Full primary", "Full fallback", "Full zero", "Full missing"]
     )
@@ -251,21 +256,26 @@ def test_compact_rag_matrix_and_depth_boundaries(
         "candidate_top_k"
     )
     assert baseline_no.loc[20, "dialogue_faiss_recall"] == 0
-    assert baseline_no.loc[40, "dialogue_faiss_recall"] == pytest.approx(0.5)
+    assert baseline_no.loc[40, "dialogue_faiss_recall"] == 1
     assert baseline_no.loc[20, "dialogue_rules_recall"] == pytest.approx(0.5)
-    assert baseline_no.loc[20, "dialogue_total_recall"] == pytest.approx(0.5)
-    assert baseline_no.loc[20, "full_rules_recall"] == pytest.approx(0.5)
+    assert baseline_no.loc[20, "dialogue_total_recall"] == pytest.approx(1 / 3)
+    assert baseline_no.loc[40, "dialogue_total_recall"] == pytest.approx(2 / 3)
+    assert baseline_no.loc[20, "full_rules_recall"] == 1
     pretrained_rows = scores[
         scores.variant == "baseline_embeddings__pretrained_reranker"
     ].set_index("candidate_top_k")
-    assert pretrained_rows.loc[20, "dialogue_faiss_recall"] == pytest.approx(0.5)
+    assert pretrained_rows.loc[20, "dialogue_faiss_recall"] == 1
     assert pretrained_rows.loc[40, "dialogue_faiss_recall"] == 1
-    assert pretrained_rows.loc[20, "full_faiss_recall"] == pytest.approx(0.5)
+    assert pretrained_rows.loc[20, "full_faiss_recall"] == 0
     assert pretrained_rows.loc[40, "full_faiss_recall"] == 1
     assert pretrained_rows.loc[20, "full_total_recall"] == pytest.approx(0.5)
     assert pretrained_rows.loc[40, "full_total_recall"] == 1
     assert pretrained.calls
     assert all(candidate_count == 40 for _, candidate_count in pretrained.calls)
+    assert {query for query, _ in pretrained.calls} == {
+        "Dialogue fallback",
+        "Full fallback",
+    }
 
     workbook = pd.ExcelFile(output / "rag_recall.xlsx")
     assert workbook.sheet_names == ["recall", "missing_hypotheses"]
@@ -273,3 +283,122 @@ def test_compact_rag_matrix_and_depth_boundaries(
     assert set(missing.dataset) == {"DIALOGUE", "FULL"}
     assert len(missing) == 2
     assert pd.read_csv(output / "rag_recall.csv").shape == scores.shape
+
+
+def test_focused_variant_skips_unused_bundle_and_pretrained_reranker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _write_workbooks(tmp_path)
+    monkeypatch.setattr(
+        "jura_hypersumm.rag.evaluation._document_hypotheses", _document_rows
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.rag.evaluation.load_rag_bundle",
+        lambda source: RagBundle(
+            str(source), Path("codex"), Path("index"), "encoder", None, False
+        ),
+    )
+    created = []
+    finetuned = _FakeReranker("finetuned")
+
+    with pytest.warns(UserWarning, match="missing from rag_tests"):
+        scores = run_rag_evaluation(
+            ["baseline", "tuned"],
+            rag_test_dir=tmp_path,
+            test_docx_dir=tmp_path,
+            results_dir=tmp_path / "focused",
+            retrieval_depths=((40, 20),),
+            retriever_factory=lambda bundle, device: (
+                created.append(bundle.name) or _EvaluationRetriever()
+            ),
+            finetuned_reranker=finetuned,
+            evaluation_variants=(
+                "baseline_embeddings__finetuned_reranker",
+            ),
+        )
+
+    assert scores["variant"].tolist() == [
+        "baseline_embeddings__finetuned_reranker"
+    ]
+    assert created == ["baseline"]
+    assert {query for query, _ in finetuned.calls} == {
+        "Dialogue fallback",
+        "Full fallback",
+    }
+
+
+def test_completed_experiment_only_recalculates_scores(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    experiment_id = "complete"
+    artifacts = tmp_path / "artifacts" / experiment_id
+    artifacts.mkdir(parents=True)
+    (artifacts / "run_config.json").write_text(
+        json.dumps(
+            {
+                "model_id": "encoder",
+                "rag_commit": "stored-rag-commit",
+                "reranker": {"base_model_id": "reranker"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "rag_manifest.json").write_text(
+        json.dumps(
+            {"reranker": {"mode": "finetuned", "local": True}}
+        ),
+        encoding="utf-8",
+    )
+    calls = {}
+
+    monkeypatch.setattr(rag_training, "configure_reproducibility", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rag_training,
+        "ensure_rag_repository",
+        lambda path, revision: calls.setdefault("rag", (Path(path), revision)),
+    )
+    monkeypatch.setattr(
+        rag_training,
+        "load_rag_bundle",
+        lambda path: SimpleNamespace(
+            reranker=SimpleNamespace(model=str(artifacts / "reranker_model"))
+        ),
+    )
+    monkeypatch.setattr(
+        rag_training,
+        "_make_evaluation_rerankers",
+        lambda **kwargs: ("pretrained", "finetuned", None, True, False, None),
+    )
+    monkeypatch.setattr(
+        rag_training,
+        "run_rag_evaluation",
+        lambda sources, **kwargs: calls.setdefault(
+            "evaluation", (sources, kwargs)
+        ),
+    )
+
+    def unexpected_training(*args, **kwargs):
+        pytest.fail("completed artifacts must bypass data conversion and training")
+
+    monkeypatch.setattr(rag_training, "convert_embedding_dataset", unexpected_training)
+    monkeypatch.setattr(rag_training, "_train_encoder", unexpected_training)
+    monkeypatch.setattr(rag_training, "build_faiss_index", unexpected_training)
+    monkeypatch.setattr(rag_training, "train_reranker", unexpected_training)
+
+    result = rag_training.run_rag_experiment(
+        experiment_id=experiment_id,
+        model_id="encoder",
+        reranker_mode="finetuned",
+        reranker_model_id="reranker",
+        rag_dir=tmp_path / "rag",
+        artifact_root=tmp_path / "artifacts",
+        results_root=tmp_path / "results",
+    )
+
+    assert result == calls["evaluation"]
+    assert calls["rag"] == (tmp_path / "rag", "stored-rag-commit")
+    sources, evaluation = calls["evaluation"]
+    assert sources == [tmp_path / "rag", artifacts / "rag_manifest.json"]
+    assert evaluation["pretrained_reranker"] == "pretrained"
+    assert evaluation["finetuned_reranker"] == "finetuned"
+    assert "skipping training" in capsys.readouterr().out

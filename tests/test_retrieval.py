@@ -284,6 +284,10 @@ def test_rule_only_retrieval_never_falls_back_to_faiss() -> None:
 
     assert [record.premise for record in resolved.results] == ["32.9/1/2"]
     assert unresolved.results == ()
+    assert unresolved.detected_citations == (
+        Citation("КоАП РФ", "999", "1", None),
+    )
+    assert unresolved.unresolved_citations == unresolved.detected_citations
     assert vectorstore.calls == []
 
 

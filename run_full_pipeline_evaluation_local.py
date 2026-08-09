@@ -20,7 +20,7 @@ def _parse_args() -> argparse.Namespace:
         "--rag-source",
         type=Path,
         default=Path("dms-rag"),
-        help="legacy dms-rag directory or tuned rag_manifest.json",
+        help="legacy directory, portable bundle directory, or rag_manifest.json",
     )
     parser.add_argument("--prompt-set", default="base")
     parser.add_argument(

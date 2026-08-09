@@ -53,6 +53,8 @@ class RetrievalOutcome:
     candidates: tuple[RetrievalRecord, ...]
     results: tuple[RetrievalRecord, ...]
     reranked: bool
+    detected_citations: tuple[Citation, ...] = ()
+    unresolved_citations: tuple[Citation, ...] = ()
 
 
 _NUMBER = r"[0-9]+(?:\.[0-9]+)*"
@@ -471,21 +473,29 @@ class PremiseRetriever:
         embedding_revision: str | None = DEFAULT_EMBEDDING_REVISION,
         embedding_device: str = "cpu",
         normalize_embeddings: bool = False,
+        embedding_query_prefix: str = "",
+        embedding_document_prefix: str = "",
+        embedding_trust_remote_code: bool = False,
+        embedding_precision: str = "float32",
+        embedding_batch_size: int = 32,
         reranker: "Reranker | None" = None,
     ) -> "PremiseRetriever":
         """Load trusted corpus/index paths with their matching encoder."""
         import pandas as pd
         from langchain_community.vectorstores import FAISS
-        from langchain_huggingface import HuggingFaceEmbeddings
+        from .rag.embeddings import SentenceTransformerEmbeddings
 
         dataframe = pd.read_csv(Path(codex_path).resolve())
-        model_kwargs: dict[str, str] = {"device": embedding_device}
-        if embedding_revision is not None and not Path(embedding_model).exists():
-            model_kwargs["revision"] = embedding_revision
-        embeddings = HuggingFaceEmbeddings(
-            model_name=embedding_model,
-            model_kwargs=model_kwargs,
-            encode_kwargs={"normalize_embeddings": normalize_embeddings},
+        embeddings = SentenceTransformerEmbeddings(
+            embedding_model,
+            revision=embedding_revision,
+            device=embedding_device,
+            trust_remote_code=embedding_trust_remote_code,
+            precision=embedding_precision,
+            batch_size=embedding_batch_size,
+            normalize_embeddings=normalize_embeddings,
+            query_prefix=embedding_query_prefix,
+            document_prefix=embedding_document_prefix,
         )
         vectorstore = FAISS.load_local(
             Path(index_dir).resolve(),
@@ -584,7 +594,13 @@ class PremiseRetriever:
             for index, (document, score) in enumerate(matches, start=1)
         )
         if self._reranker is None:
-            return RetrievalOutcome(candidates, candidates[:retained_top_k], False)
+            return RetrievalOutcome(
+                candidates,
+                candidates[:retained_top_k],
+                False,
+                detected_citations,
+                detected_citations,
+            )
         from .rag.reranking import rerank_records
 
         results = rerank_records(
@@ -593,7 +609,13 @@ class PremiseRetriever:
             self._reranker,
             final_top_k=retained_top_k,
         )
-        return RetrievalOutcome(candidates, results, True)
+        return RetrievalOutcome(
+            candidates,
+            results,
+            True,
+            detected_citations,
+            detected_citations,
+        )
 
     def retrieve_semantic_with_details(
         self,
@@ -642,7 +664,16 @@ class PremiseRetriever:
             )
             for rank, record in enumerate(exact, start=1)
         )
-        return RetrievalOutcome(results, results, False), detected_tuple
+        return (
+            RetrievalOutcome(
+                results,
+                results,
+                False,
+                detected_tuple,
+                unresolved_tuple,
+            ),
+            detected_tuple,
+        )
 
     def retrieve_rules_with_details(self, hypothesis: str) -> RetrievalOutcome:
         """Run deterministic citation extraction and exact lookup without FAISS."""

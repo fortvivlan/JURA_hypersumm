@@ -14,6 +14,13 @@ def build_faiss_index(
     batch_size: int = 32,
     chunk_size: int = 1000,
     chunk_overlap: int = 200,
+    revision: str | None = None,
+    token: str | None = None,
+    trust_remote_code: bool = False,
+    precision: str = "float32",
+    query_prefix: str = "",
+    document_prefix: str = "",
+    embeddings=None,
 ) -> dict[str, int]:
     """Embed codex chunks and save a LangChain-compatible FAISS index."""
     import faiss
@@ -22,8 +29,9 @@ def build_faiss_index(
     from langchain_community.docstore.in_memory import InMemoryDocstore
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
-    from langchain_huggingface import HuggingFaceEmbeddings
     from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    from .embeddings import SentenceTransformerEmbeddings
 
     if batch_size <= 0 or chunk_size <= 0:
         raise ValueError("batch_size and chunk_size must be positive")
@@ -41,12 +49,20 @@ def build_faiss_index(
     chunks = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     ).split_documents(documents)
-    embeddings = HuggingFaceEmbeddings(
-        model_name=str(embedding_model),
-        model_kwargs={"device": device},
-        encode_kwargs={"batch_size": batch_size, "normalize_embeddings": True},
-        show_progress=True,
-    )
+    if embeddings is None:
+        embeddings = SentenceTransformerEmbeddings(
+            embedding_model,
+            revision=revision,
+            token=token,
+            trust_remote_code=trust_remote_code,
+            device=device,
+            precision=precision,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+            show_progress=True,
+        )
     vectors = np.asarray(
         embeddings.embed_documents([chunk.page_content for chunk in chunks]),
         dtype=np.float32,

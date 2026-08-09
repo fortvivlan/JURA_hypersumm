@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from jura_hypersumm.full_pipeline import run_full_pipeline_evaluation
-from jura_hypersumm.rag.artifacts import RagBundle
+from jura_hypersumm.rag.artifacts import RagBundle, RerankerBundle
 
 
 def test_full_pipeline_state_resumes_completed_jobs(monkeypatch, tmp_path: Path) -> None:
@@ -125,3 +125,92 @@ def test_legacy_retrieval_top_k_override_sets_both_depths(
 
     assert observed["candidate_top_k"] == 37
     assert observed["final_top_k"] == 37
+
+
+def test_full_pipeline_forwards_asymmetric_embedding_bundle_options(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "models.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "bert-binary",
+                        "family": "bert",
+                        "task": "binary",
+                        "path": "artifact",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "prompt.py").write_text('PROMPT_TEXT = "t"', encoding="utf-8")
+    (tmp_path / "prompt_binary.py").write_text(
+        'PROMPT_TEXT_BIN = "b"', encoding="utf-8"
+    )
+    reranker_path = tmp_path / "reranker"
+    reranker_path.mkdir()
+    bundle = RagBundle(
+        "qwen-rag",
+        tmp_path / "codex.csv",
+        tmp_path / "index",
+        "qwen-embedding",
+        None,
+        True,
+        embedding_query_prefix="query:",
+        embedding_document_prefix="passage:",
+        embedding_trust_remote_code=True,
+        embedding_precision="bfloat16",
+        embedding_batch_size=16,
+        reranker=RerankerBundle(
+            "finetuned", str(reranker_path), None, True, 1024
+        ),
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.full_pipeline.load_rag_bundle", lambda path: bundle
+    )
+    observed = {}
+
+    def fake_retriever(*args, **kwargs):
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "jura_hypersumm.full_pipeline.PremiseRetriever.from_components",
+        fake_retriever,
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.full_pipeline._load_predictor",
+        lambda entry, prompt, parameters: (object(), object(), object()),
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.full_pipeline._evaluate_one",
+        lambda entry, **kwargs: {"scores": pd.DataFrame([{"model": entry.name}])},
+    )
+
+    class FakeReranker:
+        def __init__(self, model_id, **kwargs):
+            self.model_id = model_id
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        "jura_hypersumm.full_pipeline.CrossEncoderReranker", FakeReranker
+    )
+
+    run_full_pipeline_evaluation(
+        models_source=manifest,
+        rag_source=tmp_path / "rag-qwen",
+        reranker_mode="bundle",
+        repo_root=tmp_path,
+        results_dir=tmp_path / "results",
+    )
+
+    assert observed["embedding_query_prefix"] == "query:"
+    assert observed["embedding_document_prefix"] == "passage:"
+    assert observed["embedding_trust_remote_code"] is True
+    assert observed["embedding_precision"] == "bfloat16"
+    assert observed["embedding_batch_size"] == 16
+    assert observed["reranker"].model_id == str(reranker_path)
+    assert observed["reranker"].kwargs["trust_remote_code"] is True
