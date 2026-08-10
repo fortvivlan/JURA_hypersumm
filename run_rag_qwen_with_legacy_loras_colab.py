@@ -49,10 +49,50 @@ def _adapter_base(adapter_dir: Path) -> str:
     return base
 
 
+def _bert_artifacts(bert_models_dir: Path) -> dict[str, Path]:
+    artifacts: dict[str, Path] = {}
+    for task in TASKS:
+        candidates = [
+            bert_models_dir / task,
+            bert_models_dir / "models" / "bert" / task,
+        ]
+        for config_path in bert_models_dir.rglob("run_config.json"):
+            try:
+                run_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if str(run_config.get("task", "")).casefold() == task:
+                candidates.append(config_path.parent)
+        complete = []
+        for candidate in dict.fromkeys(path.resolve() for path in candidates):
+            has_weights = any(
+                (candidate / filename).is_file()
+                for filename in ("model.safetensors", "pytorch_model.bin")
+            )
+            has_tokenizer = any(
+                (candidate / filename).is_file()
+                for filename in ("tokenizer.json", "vocab.txt")
+            )
+            if (candidate / "config.json").is_file() and has_weights and has_tokenizer:
+                complete.append(candidate)
+        if len(complete) != 1:
+            raise FileNotFoundError(
+                f"Expected one complete {task} BERT artifact below "
+                f"{bert_models_dir}, found {len(complete)}"
+            )
+        artifacts[task] = complete[0]
+    return artifacts
+
+
 def _mixed_models(
     campaign_dir: Path,
     adapters_dir: Path,
-) -> tuple[list[InferenceModel], dict[str, dict[str, str]]]:
+    bert_models_dir: Path,
+) -> tuple[
+    list[InferenceModel],
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+]:
     models = resolve_models_source(campaign_dir)
     loras = [model for model in models if model.family == "lora"]
     if len(models) != 18 or len(loras) != 8:
@@ -91,9 +131,31 @@ def _mixed_models(
             ),
         }
 
+    bert_artifacts = _bert_artifacts(bert_models_dir)
+    bert_provenance: dict[str, dict[str, str]] = {}
+    for task, artifact_dir in bert_artifacts.items():
+        weights_path = next(
+            path
+            for path in (
+                artifact_dir / "model.safetensors",
+                artifact_dir / "pytorch_model.bin",
+            )
+            if path.is_file()
+        )
+        bert_provenance[task] = {
+            "artifact_dir": str(artifact_dir),
+            "weights_sha256": file_sha256(weights_path),
+            "config_sha256": file_sha256(artifact_dir / "config.json"),
+        }
+
     mixed: list[InferenceModel] = []
     replaced_names: set[str] = set()
     for model in models:
+        if model.family == "bert":
+            mixed.append(
+                replace(model, path_or_id=str(bert_artifacts[model.task]))
+            )
+            continue
         if model.family != "lora":
             mixed.append(model)
             continue
@@ -112,7 +174,7 @@ def _mixed_models(
         replaced_names.add(model.name)
     if len(replaced_names) != 8:
         raise ValueError("Drive adapter replacement did not resolve eight jobs")
-    return mixed, provenance
+    return mixed, provenance, bert_provenance
 
 
 def _write_models_input(models: Sequence[InferenceModel], path: Path) -> Path:
@@ -195,6 +257,7 @@ def run_rag_qwen_with_legacy_loras_colab(
     data_root: str | Path = "/content",
     drive_root: str | Path = "/content/drive/MyDrive",
     campaign_dir: str | Path | None = None,
+    bert_models_dir: str | Path | None = None,
     lora_adapters_dir: str | Path | None = None,
     rag_source: str | Path | None = None,
     autotest_dir: str | Path | None = None,
@@ -232,6 +295,9 @@ def run_rag_qwen_with_legacy_loras_colab(
     campaign = _resolve_path(
         campaign_dir or "full_pipeline_v1", relative_to=data
     )
+    bert_models = _resolve_path(
+        bert_models_dir or "croc_bert", relative_to=drive
+    )
     adapters = _resolve_path(
         lora_adapters_dir or "lora_adapters", relative_to=drive
     )
@@ -255,7 +321,9 @@ def run_rag_qwen_with_legacy_loras_colab(
         test_docx_dir=documents,
         rag_source=rag,
     )
-    models, provenance = _mixed_models(campaign, adapters)
+    models, provenance, bert_provenance = _mixed_models(
+        campaign, adapters, bert_models
+    )
     selected_models = [
         model
         for model in models
@@ -264,23 +332,32 @@ def run_rag_qwen_with_legacy_loras_colab(
     if not selected_models:
         raise ValueError("The family/task selection produced no evaluation jobs")
 
-    digest = hashlib.sha256(
+    adapter_digest = hashlib.sha256(
         json.dumps(provenance, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    artifact_digest = hashlib.sha256(
+        json.dumps(
+            {"legacy_adapters": provenance, "bert_models": bert_provenance},
+            sort_keys=True,
+        ).encode("utf-8")
     ).hexdigest()
     plan = {
         "project_root": str(project),
         "data_root": str(data),
         "campaign_dir": str(campaign),
+        "bert_models_dir": str(bert_models),
         "lora_adapters_dir": str(adapters),
         "rag_source": str(rag),
         "autotest_dir": str(autotest),
         "test_docx_dir": str(documents),
         "results_dir": str(output),
-        "adapter_set_sha256": digest,
+        "adapter_set_sha256": adapter_digest,
+        "artifact_set_sha256": artifact_digest,
         "candidate_top_k": 100,
         "final_top_k": 60,
         "models": [asdict(model) for model in selected_models],
         "legacy_adapters": provenance,
+        "bert_models": bert_provenance,
     }
     if dry_run:
         return plan
@@ -289,7 +366,7 @@ def run_rag_qwen_with_legacy_loras_colab(
     provenance_path = output / "legacy_adapter_set.json"
     if provenance_path.is_file():
         existing = json.loads(provenance_path.read_text(encoding="utf-8"))
-        if existing.get("adapter_set_sha256") != digest:
+        if existing.get("artifact_set_sha256") != artifact_digest:
             raise ValueError(
                 "The Drive results directory belongs to another adapter set; "
                 "choose a new results_dir."
@@ -333,6 +410,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=Path("/content"))
     parser.add_argument("--drive-root", type=Path, default=Path("/content/drive/MyDrive"))
     parser.add_argument("--campaign-dir", type=Path)
+    parser.add_argument("--bert-models-dir", type=Path)
     parser.add_argument("--lora-adapters-dir", type=Path)
     parser.add_argument("--rag-source", type=Path)
     parser.add_argument("--autotest-dir", type=Path)
@@ -367,6 +445,7 @@ if __name__ == "__main__":
         data_root=arguments.data_root,
         drive_root=arguments.drive_root,
         campaign_dir=arguments.campaign_dir,
+        bert_models_dir=arguments.bert_models_dir,
         lora_adapters_dir=arguments.lora_adapters_dir,
         rag_source=arguments.rag_source,
         autotest_dir=arguments.autotest_dir,

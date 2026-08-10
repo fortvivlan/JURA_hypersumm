@@ -526,6 +526,7 @@ select a GPU runtime, and arrange the inputs as follows:
 /content/val_ternary.csv
 /content/autotest/               reviewed Dialogue and Full workbooks
 /content/test_docx/              matching Dialogue and Full DOCX files
+/content/drive/MyDrive/croc_bert/     binary/ and ternary/ BERT artifacts
 /content/drive/MyDrive/lora_adapters/  eight legacy adapter directories
 /content/drive/MyDrive/rag-qwen/       portable RAG bundle and manifest
 ```

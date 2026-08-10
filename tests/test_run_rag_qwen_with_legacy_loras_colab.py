@@ -25,6 +25,7 @@ def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     (data / "test_docx").mkdir()
     (data / "full_pipeline_v1").mkdir()
     (drive / "lora_adapters").mkdir()
+    (drive / "croc_bert").mkdir()
     rag = drive / "rag-qwen"
     rag.mkdir()
     (rag / "rag_manifest.json").write_text("{}", encoding="utf-8")
@@ -46,7 +47,11 @@ def test_colab_dry_run_resolves_content_and_drive_defaults(
     monkeypatch.setattr(
         colab_runner,
         "_mixed_models",
-        lambda campaign, adapters: (_models(), {"set": {"adapter_sha256": "a"}}),
+        lambda campaign, adapters, bert: (
+            _models(),
+            {"set": {"adapter_sha256": "a"}},
+            {"binary": {"weights_sha256": "b"}},
+        ),
     )
 
     plan = colab_runner.run_rag_qwen_with_legacy_loras_colab(
@@ -59,6 +64,7 @@ def test_colab_dry_run_resolves_content_and_drive_defaults(
     )
 
     assert plan["campaign_dir"] == str((data / "full_pipeline_v1").resolve())
+    assert plan["bert_models_dir"] == str((drive / "croc_bert").resolve())
     assert plan["lora_adapters_dir"] == str((drive / "lora_adapters").resolve())
     assert plan["rag_source"] == str((drive / "rag-qwen").resolve())
     assert [model["name"] for model in plan["models"]] == ["qwen-lora"]
@@ -71,7 +77,11 @@ def test_colab_runner_writes_drive_manifest_and_forwards_data_paths(
     monkeypatch.setattr(
         colab_runner,
         "_mixed_models",
-        lambda campaign, adapters: (_models(), {"set": {"adapter_sha256": "a"}}),
+        lambda campaign, adapters, bert: (
+            _models(),
+            {"set": {"adapter_sha256": "a"}},
+            {"binary": {"weights_sha256": "b"}},
+        ),
     )
     observed = {}
 
@@ -109,3 +119,22 @@ def test_colab_runner_requires_mounted_drive(tmp_path: Path) -> None:
             drive_root=tmp_path / "missing-drive",
             dry_run=True,
         )
+
+
+def test_bert_artifacts_support_direct_binary_and_ternary_folders(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "croc_bert"
+    for task in ("binary", "ternary"):
+        artifact = root / task
+        artifact.mkdir(parents=True)
+        (artifact / "config.json").write_text("{}", encoding="utf-8")
+        (artifact / "model.safetensors").write_bytes(b"weights")
+        (artifact / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    artifacts = colab_runner._bert_artifacts(root)
+
+    assert artifacts == {
+        "binary": (root / "binary").resolve(),
+        "ternary": (root / "ternary").resolve(),
+    }
