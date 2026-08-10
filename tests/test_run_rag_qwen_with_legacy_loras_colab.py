@@ -97,6 +97,8 @@ def test_colab_runner_writes_drive_manifest_and_forwards_data_paths(
         data_root=data,
         drive_root=drive,
         results_dir=output,
+        candidate_top_k=40,
+        final_top_k=15,
         max_retries=0,
     )
 
@@ -106,6 +108,8 @@ def test_colab_runner_writes_drive_manifest_and_forwards_data_paths(
     assert observed["autotest_dir"] == (data / "autotest").resolve()
     assert observed["test_docx_dir"] == (data / "test_docx").resolve()
     assert observed["inference_parameters"]["max_retries"] == 0
+    assert observed["inference_parameters"]["candidate_top_k"] == 40
+    assert observed["inference_parameters"]["final_top_k"] == 15
     assert (output / "legacy_adapter_set.json").is_file()
     models = json.loads((output / "colab_models_input.json").read_text(encoding="utf-8"))
     assert len(models["models"]) == 3
@@ -138,3 +142,19 @@ def test_bert_artifacts_support_direct_binary_and_ternary_folders(
         "binary": (root / "binary").resolve(),
         "ternary": (root / "ternary").resolve(),
     }
+
+
+def test_colab_runner_rejects_final_depth_above_candidate_depth(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project, data, drive = _layout(tmp_path)
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        colab_runner.run_rag_qwen_with_legacy_loras_colab(
+            project_root=project,
+            data_root=data,
+            drive_root=drive,
+            candidate_top_k=10,
+            final_top_k=20,
+            dry_run=True,
+        )

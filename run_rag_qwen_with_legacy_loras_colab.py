@@ -271,6 +271,8 @@ def run_rag_qwen_with_legacy_loras_colab(
     reranker_device: str = "cuda",
     reranker_batch_size: int = 8,
     reranker_precision: str = "auto",
+    candidate_top_k: int = 100,
+    final_top_k: int = 60,
     quantization: bool = True,
     precision: str = "auto",
     device_map: str = "auto",
@@ -314,6 +316,10 @@ def run_rag_qwen_with_legacy_loras_colab(
         families, MODEL_FAMILIES, "model families"
     )
     selected_tasks = _normalize_selection(tasks, TASKS, "tasks")
+    if candidate_top_k <= 0 or final_top_k <= 0:
+        raise ValueError("candidate_top_k and final_top_k must be positive")
+    if final_top_k > candidate_top_k:
+        raise ValueError("final_top_k cannot exceed candidate_top_k")
     _preflight_data(
         project_root=project,
         data_root=data,
@@ -353,8 +359,8 @@ def run_rag_qwen_with_legacy_loras_colab(
         "results_dir": str(output),
         "adapter_set_sha256": adapter_digest,
         "artifact_set_sha256": artifact_digest,
-        "candidate_top_k": 100,
-        "final_top_k": 60,
+        "candidate_top_k": candidate_top_k,
+        "final_top_k": final_top_k,
         "models": [asdict(model) for model in selected_models],
         "legacy_adapters": provenance,
         "bert_models": bert_provenance,
@@ -391,8 +397,8 @@ def run_rag_qwen_with_legacy_loras_colab(
             "document_batch_size": document_batch_size,
             "llm_batch_size": llm_batch_size,
             "embedding_device": embedding_device,
-            "candidate_top_k": 100,
-            "final_top_k": 60,
+            "candidate_top_k": candidate_top_k,
+            "final_top_k": final_top_k,
             "reranker_device": reranker_device,
             "reranker_batch_size": reranker_batch_size,
             "reranker_precision": reranker_precision,
@@ -423,6 +429,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-device", default="cuda")
     parser.add_argument("--reranker-device", default="cuda")
     parser.add_argument("--reranker-batch-size", type=int, default=8)
+    parser.add_argument("--candidate-top-k", type=int, default=100)
+    parser.add_argument("--final-top-k", type=int, default=60)
     parser.add_argument(
         "--reranker-precision",
         choices=("auto", "float16", "bfloat16", "float32"),
@@ -459,6 +467,8 @@ if __name__ == "__main__":
         reranker_device=arguments.reranker_device,
         reranker_batch_size=arguments.reranker_batch_size,
         reranker_precision=arguments.reranker_precision,
+        candidate_top_k=arguments.candidate_top_k,
+        final_top_k=arguments.final_top_k,
         quantization=arguments.quantization,
         precision=arguments.precision,
         device_map=arguments.device_map,

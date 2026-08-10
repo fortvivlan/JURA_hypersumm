@@ -573,9 +573,10 @@ lora_ternary_scores = run_rag_qwen_with_legacy_loras_colab(
 The main memory knobs are `document_batch_size`, `llm_batch_size`,
 `quantization`, `precision`, `device_map`, `reranker_batch_size`,
 `reranker_precision`, `embedding_device`, and `reranker_device`. Quantized
-4-bit LLM loading is enabled by default; BERT is never quantized. The selected
-RAG depth remains the fixed experiment setting of 100 candidates and 60 final
-premises.
+4-bit LLM loading is enabled by default; BERT is never quantized. Retrieval
+defaults to 100 candidates and 60 final reranked premises. Override it with,
+for example, `candidate_top_k=40, final_top_k=20`. Use a new results directory
+for each retrieval-depth setting so resumable states and scores are not mixed.
 
 In Colab, the existing Drive folder is expected at
 `/content/drive/MyDrive/jura`. Native runs instead accept an explicit local
