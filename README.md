@@ -515,13 +515,13 @@ considered compromised and revoked.
 ### RAG-Qwen evaluation with legacy LoRAs on Drive
 
 `run_rag_qwen_with_legacy_loras_colab.py` exposes
-`run_rag_qwen_with_legacy_loras_colab(...)`. It evaluates the existing BERT,
-base-LLM, and restored legacy-LoRA jobs without training. The module does not
+`run_rag_qwen_with_legacy_loras_colab(...)`. It constructs and evaluates the
+two Drive BERTs, eight base-LLM jobs, and eight restored legacy-LoRA jobs
+without training or requiring a local campaign directory. The module does not
 mount Drive or install packages. Install the Colab dependencies as shown above,
 select a GPU runtime, and arrange the inputs as follows:
 
 ```text
-/content/full_pipeline_v1/       complete campaign (BERTs and job manifests)
 /content/val_binary.csv
 /content/val_ternary.csv
 /content/autotest/               reviewed Dialogue and Full workbooks

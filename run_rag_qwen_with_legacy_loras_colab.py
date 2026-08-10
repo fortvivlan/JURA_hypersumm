@@ -32,6 +32,18 @@ LEGACY_ADAPTER_DIRS: dict[tuple[str, str], str] = {
 
 MODEL_FAMILIES = ("bert", "lora", "base_llm")
 TASKS = ("binary", "ternary")
+BASE_MODEL_REVISIONS = {
+    "meta-llama/Llama-3.1-8B": "d04e592bb4f6aa9cfee91e2e20afa771667e1d4b",
+    "mistralai/Ministral-8B-Instruct-2410": (
+        "2f494a194c5b980dfb9772cb92d26cbb671fce5a"
+    ),
+    "Qwen/Qwen3-8B": "b968826d9c46dd6066d109eabc6255188de91218",
+    "t-tech/T-lite-it-2.1": "d125c970c553de58fcee3c937d5e4867d4a448d8",
+}
+TRAINING_PROMPT_SHA256 = {
+    "binary": "07f74a37e06e33bd97b07636016a54fd36b05920c7ea41327bc5ec1a39a4c92b",
+    "ternary": "0224fb5b30bd6c5034e202618d5c64754d566ead2456ed080140aff03c3da828",
+}
 
 
 def _resolve_path(value: str | Path, *, relative_to: Path) -> Path:
@@ -177,6 +189,113 @@ def _mixed_models(
     return mixed, provenance, bert_provenance
 
 
+def _drive_models(
+    adapters_dir: Path,
+    bert_models_dir: Path,
+) -> tuple[
+    list[InferenceModel],
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+]:
+    """Build the complete matrix directly from Drive artifacts."""
+    replacements: dict[tuple[str, str], Path] = {}
+    adapter_provenance: dict[str, dict[str, str]] = {}
+    for key, directory_name in LEGACY_ADAPTER_DIRS.items():
+        adapter_dir = (adapters_dir / directory_name).resolve()
+        required = (
+            adapter_dir / "adapter_config.json",
+            adapter_dir / "adapter_model.safetensors",
+            adapter_dir / "tokenizer_config.json",
+            adapter_dir / "tokenizer.json",
+        )
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "Incomplete Drive adapter: " + ", ".join(missing)
+            )
+        actual_base = _adapter_base(adapter_dir)
+        if actual_base != key[0]:
+            raise ValueError(
+                f"Adapter base mismatch at {adapter_dir}: "
+                f"{actual_base!r} != {key[0]!r}"
+            )
+        replacements[key] = adapter_dir
+        adapter_provenance[f"{key[0]}:{key[1]}"] = {
+            "adapter_dir": str(adapter_dir),
+            "adapter_sha256": file_sha256(
+                adapter_dir / "adapter_model.safetensors"
+            ),
+            "adapter_config_sha256": file_sha256(
+                adapter_dir / "adapter_config.json"
+            ),
+        }
+
+    bert_artifacts = _bert_artifacts(bert_models_dir)
+    bert_provenance: dict[str, dict[str, str]] = {}
+    models: list[InferenceModel] = []
+    for task in TASKS:
+        artifact_dir = bert_artifacts[task]
+        weights_path = next(
+            path
+            for path in (
+                artifact_dir / "model.safetensors",
+                artifact_dir / "pytorch_model.bin",
+            )
+            if path.is_file()
+        )
+        run_config_path = artifact_dir / "run_config.json"
+        run_config = (
+            json.loads(run_config_path.read_text(encoding="utf-8"))
+            if run_config_path.is_file()
+            else {}
+        )
+        bert_provenance[task] = {
+            "artifact_dir": str(artifact_dir),
+            "weights_sha256": file_sha256(weights_path),
+            "config_sha256": file_sha256(artifact_dir / "config.json"),
+        }
+        models.append(
+            InferenceModel(
+                name=f"models__bert__{task}__{task}",
+                family="bert",
+                task=task,
+                path_or_id=str(artifact_dir),
+                revision=run_config.get("resolved_revision"),
+            )
+        )
+
+    for base_model, revision in BASE_MODEL_REVISIONS.items():
+        slug = base_model.replace("/", "_")
+        for task in TASKS:
+            models.append(
+                InferenceModel(
+                    name=f"models__lora__{slug}__{task}__{task}",
+                    family="lora",
+                    task=task,
+                    path_or_id=str(replacements[(base_model, task)]),
+                    revision=revision,
+                    base_model_path_or_id=base_model,
+                    training_prompt_sha256=TRAINING_PROMPT_SHA256[task],
+                    training_premise_format=SOURCE_PREFIXED_PREMISE_FORMAT,
+                )
+            )
+    for base_model, revision in BASE_MODEL_REVISIONS.items():
+        slug = base_model.replace("/", "_")
+        for task in TASKS:
+            models.append(
+                InferenceModel(
+                    name=f"base__{slug}__{task}",
+                    family="base_llm",
+                    task=task,
+                    path_or_id=base_model,
+                    revision=revision,
+                )
+            )
+    if len(models) != 18:
+        raise RuntimeError(f"Expected 18 Drive jobs, constructed {len(models)}")
+    return models, adapter_provenance, bert_provenance
+
+
 def _write_models_input(models: Sequence[InferenceModel], path: Path) -> Path:
     entries: list[dict[str, Any]] = []
     for model in models:
@@ -279,7 +398,7 @@ def run_rag_qwen_with_legacy_loras_colab(
     max_retries: int = 0,
     dry_run: bool = False,
 ):
-    """Evaluate selected campaign jobs using content data and Drive artifacts.
+    """Evaluate selected jobs using content data and Drive model artifacts.
 
     The function expects validation CSVs and benchmark folders under
     ``data_root`` by default. It reads legacy adapters and the portable
@@ -294,8 +413,10 @@ def run_rag_qwen_with_legacy_loras_colab(
             f"Drive root is unavailable; mount Drive before calling: {drive}"
         )
 
-    campaign = _resolve_path(
-        campaign_dir or "full_pipeline_v1", relative_to=data
+    campaign = (
+        _resolve_path(campaign_dir, relative_to=data)
+        if campaign_dir is not None
+        else None
     )
     bert_models = _resolve_path(
         bert_models_dir or "croc_bert", relative_to=drive
@@ -327,9 +448,14 @@ def run_rag_qwen_with_legacy_loras_colab(
         test_docx_dir=documents,
         rag_source=rag,
     )
-    models, provenance, bert_provenance = _mixed_models(
-        campaign, adapters, bert_models
-    )
+    if campaign is None:
+        models, provenance, bert_provenance = _drive_models(
+            adapters, bert_models
+        )
+    else:
+        models, provenance, bert_provenance = _mixed_models(
+            campaign, adapters, bert_models
+        )
     selected_models = [
         model
         for model in models
@@ -350,7 +476,7 @@ def run_rag_qwen_with_legacy_loras_colab(
     plan = {
         "project_root": str(project),
         "data_root": str(data),
-        "campaign_dir": str(campaign),
+        "campaign_dir": str(campaign) if campaign is not None else None,
         "bert_models_dir": str(bert_models),
         "lora_adapters_dir": str(adapters),
         "rag_source": str(rag),

@@ -46,8 +46,8 @@ def test_colab_dry_run_resolves_content_and_drive_defaults(
     project, data, drive = _layout(tmp_path)
     monkeypatch.setattr(
         colab_runner,
-        "_mixed_models",
-        lambda campaign, adapters, bert: (
+        "_drive_models",
+        lambda adapters, bert: (
             _models(),
             {"set": {"adapter_sha256": "a"}},
             {"binary": {"weights_sha256": "b"}},
@@ -63,7 +63,7 @@ def test_colab_dry_run_resolves_content_and_drive_defaults(
         dry_run=True,
     )
 
-    assert plan["campaign_dir"] == str((data / "full_pipeline_v1").resolve())
+    assert plan["campaign_dir"] is None
     assert plan["bert_models_dir"] == str((drive / "croc_bert").resolve())
     assert plan["lora_adapters_dir"] == str((drive / "lora_adapters").resolve())
     assert plan["rag_source"] == str((drive / "rag-qwen").resolve())
@@ -76,8 +76,8 @@ def test_colab_runner_writes_drive_manifest_and_forwards_data_paths(
     project, data, drive = _layout(tmp_path)
     monkeypatch.setattr(
         colab_runner,
-        "_mixed_models",
-        lambda campaign, adapters, bert: (
+        "_drive_models",
+        lambda adapters, bert: (
             _models(),
             {"set": {"adapter_sha256": "a"}},
             {"binary": {"weights_sha256": "b"}},
@@ -142,6 +142,39 @@ def test_bert_artifacts_support_direct_binary_and_ternary_folders(
         "binary": (root / "binary").resolve(),
         "ternary": (root / "ternary").resolve(),
     }
+
+
+def test_drive_models_constructs_full_matrix_without_campaign(
+    tmp_path: Path,
+) -> None:
+    adapters = tmp_path / "lora_adapters"
+    for (base_model, _task), directory_name in colab_runner.LEGACY_ADAPTER_DIRS.items():
+        artifact = adapters / directory_name
+        artifact.mkdir(parents=True)
+        (artifact / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": base_model}), encoding="utf-8"
+        )
+        (artifact / "adapter_model.safetensors").write_bytes(b"adapter")
+        (artifact / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        (artifact / "tokenizer.json").write_text("{}", encoding="utf-8")
+    bert = tmp_path / "croc_bert"
+    for task in ("binary", "ternary"):
+        artifact = bert / task
+        artifact.mkdir(parents=True)
+        (artifact / "config.json").write_text("{}", encoding="utf-8")
+        (artifact / "model.safetensors").write_bytes(b"bert")
+        (artifact / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    models, adapter_provenance, bert_provenance = colab_runner._drive_models(
+        adapters, bert
+    )
+
+    assert len(models) == 18
+    assert sum(model.family == "bert" for model in models) == 2
+    assert sum(model.family == "lora" for model in models) == 8
+    assert sum(model.family == "base_llm" for model in models) == 8
+    assert len(adapter_provenance) == 8
+    assert set(bert_provenance) == {"binary", "ternary"}
 
 
 def test_colab_runner_rejects_final_depth_above_candidate_depth(
