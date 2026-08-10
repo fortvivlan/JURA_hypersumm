@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from jura_hypersumm.full_pipeline import (
+    _evict_huggingface_model_revision,
     _include_source_prefix,
     _load_adapter_tokenizer,
     run_full_pipeline_evaluation,
@@ -15,6 +16,50 @@ def test_source_prefix_policy_is_limited_to_generative_models() -> None:
     assert not _include_source_prefix("bert")
     assert _include_source_prefix("base_llm")
     assert _include_source_prefix("lora")
+
+
+def test_huggingface_cache_eviction_targets_only_exact_revision(monkeypatch) -> None:
+    class Revision:
+        def __init__(self, commit_hash: str) -> None:
+            self.commit_hash = commit_hash
+
+    class Repo:
+        repo_type = "model"
+
+        def __init__(self, repo_id: str, revisions: tuple[Revision, ...]) -> None:
+            self.repo_id = repo_id
+            self.revisions = revisions
+
+    class Strategy:
+        expected_freed_size = 123
+        executed = False
+
+        def execute(self) -> None:
+            self.executed = True
+
+    strategy = Strategy()
+
+    class Cache:
+        repos = {
+            Repo("meta-llama/Llama-3.1-8B", (Revision("wanted"),)),
+            Repo("Qwen/Qwen3-8B", (Revision("other"),)),
+        }
+        deleted: tuple[str, ...] = ()
+
+        def delete_revisions(self, *revisions: str):
+            self.deleted = revisions
+            return strategy
+
+    cache = Cache()
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir", lambda: cache)
+
+    freed = _evict_huggingface_model_revision(
+        "meta-llama/Llama-3.1-8B", "wanted"
+    )
+
+    assert freed == 123
+    assert cache.deleted == ("wanted",)
+    assert strategy.executed is True
 
 
 def test_legacy_adapter_tokenizer_falls_back_to_base(
@@ -44,7 +89,9 @@ def test_legacy_adapter_tokenizer_falls_back_to_base(
     assert loaded.padding_side == "left"
 
 
-def test_full_pipeline_state_resumes_completed_jobs(monkeypatch, tmp_path: Path) -> None:
+def test_full_pipeline_recovers_corrupt_state_and_resumes_completed_jobs(
+    monkeypatch, tmp_path: Path
+) -> None:
     manifest = tmp_path / "models.json"
     manifest.write_text(
         json.dumps(
@@ -97,7 +144,14 @@ def test_full_pipeline_state_resumes_completed_jobs(monkeypatch, tmp_path: Path)
         repo_root=tmp_path,
         results_dir=results,
     )
+    (results / "state.json").write_text("", encoding="utf-8")
     second = run_full_pipeline_evaluation(
+        models_source=manifest,
+        rag_source=tmp_path / "rag.json",
+        repo_root=tmp_path,
+        results_dir=results,
+    )
+    third = run_full_pipeline_evaluation(
         models_source=manifest,
         rag_source=tmp_path / "rag.json",
         repo_root=tmp_path,
@@ -107,6 +161,11 @@ def test_full_pipeline_state_resumes_completed_jobs(monkeypatch, tmp_path: Path)
     assert calls == ["bert-binary"]
     assert first["model_name"].tolist() == ["bert-binary"]
     assert second["model_name"].tolist() == ["bert-binary"]
+    assert third["model_name"].tolist() == ["bert-binary"]
+    assert list(results.glob("state.corrupt-*.json"))
+    recovered_state = json.loads((results / "state.json").read_text(encoding="utf-8"))
+    assert recovered_state["jobs"]["bert-binary"]["status"] == "completed"
+    assert recovered_state["jobs"]["bert-binary"]["recovered_from_outputs"] is True
 
 
 def test_legacy_retrieval_top_k_override_sets_both_depths(

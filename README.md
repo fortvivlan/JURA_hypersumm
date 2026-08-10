@@ -524,8 +524,8 @@ select a GPU runtime, and arrange the inputs as follows:
 ```text
 /content/val_binary.csv
 /content/val_ternary.csv
-/content/autotest/               reviewed Dialogue and Full workbooks
-/content/test_docx/              matching Dialogue and Full DOCX files
+/content/drive/MyDrive/jura/autotest/   reviewed Dialogue and Full workbooks
+/content/drive/MyDrive/jura/test_docx/  matching Dialogue and Full DOCX files
 /content/drive/MyDrive/croc_bert/     binary/ and ternary/ BERT artifacts
 /content/drive/MyDrive/lora_adapters/  eight legacy adapter directories
 /content/drive/MyDrive/rag-qwen/       portable RAG bundle and manifest
@@ -554,7 +554,20 @@ By default, outputs are written to
 They include per-job `results.xlsx` and `scores.csv`, combined `all_scores.csv`
 and `all_scores.xlsx`, raw predictions, resolved model/adaptor provenance, and
 `state.json` for restart after a disconnected runtime. Reuse exactly the same
-arguments to resume.
+arguments and `results_dir` to resume. Completed jobs with intact per-job
+`results.xlsx` and `scores.csv` are skipped. If a disk-full crash left
+`state.json` or a generated Colab manifest empty/partial, the runner preserves
+it under a `*.corrupt-<timestamp>.json` name, reconstructs completion from the
+per-job files, and evaluates only missing or incomplete jobs.
+
+To limit Colab disk use, the default run deletes only the pinned
+`meta-llama/Llama-3.1-8B` cache snapshot after the last selected Llama LoRA job
+and again after the last selected Llama base-model job. It never deletes the
+Drive adapters or another cached model. The base-Llama jobs are scheduled
+immediately after the Llama LoRA jobs, so its re-downloaded snapshot is removed
+before the other three instruction-LLM snapshots accumulate. This intentionally
+trades one Llama re-download for lower peak disk use. Set
+`evict_llama_cache_between_families=False` to keep the snapshot instead.
 
 For an urgent partial run, select families and tasks and give that selection a
 separate results directory:

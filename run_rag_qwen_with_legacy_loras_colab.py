@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +45,29 @@ TRAINING_PROMPT_SHA256 = {
     "binary": "07f74a37e06e33bd97b07636016a54fd36b05920c7ea41327bc5ec1a39a4c92b",
     "ternary": "0224fb5b30bd6c5034e202618d5c64754d566ead2456ed080140aff03c3da828",
 }
+LLAMA_MODEL_ID = "meta-llama/Llama-3.1-8B"
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    """Write a generated Colab manifest atomically."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _backup_corrupt_json(path: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = path.with_name(f"{path.stem}.corrupt-{stamp}{path.suffix}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.stem}.corrupt-{stamp}-{counter}{path.suffix}"
+        )
+        counter += 1
+    path.replace(candidate)
+    return candidate
 
 
 def _resolve_path(value: str | Path, *, relative_to: Path) -> Path:
@@ -325,10 +349,7 @@ def _write_models_input(models: Sequence[InferenceModel], path: Path) -> Path:
                 else model.base_model_path_or_id
             )
         entries.append(entry)
-    path.write_text(
-        json.dumps({"models": entries}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _atomic_write_json(path, {"models": entries})
     return path
 
 
@@ -342,6 +363,60 @@ def _normalize_selection(
     if not normalized:
         raise ValueError(f"At least one {label} is required")
     return normalized
+
+
+def _llama_cache_evictions(
+    models: Sequence[InferenceModel],
+) -> dict[str, tuple[str, str]]:
+    """Evict Llama after its last selected LoRA job and base-model job."""
+    boundaries: dict[str, tuple[str, str]] = {}
+    revision = BASE_MODEL_REVISIONS[LLAMA_MODEL_ID]
+    for family in ("lora", "base_llm"):
+        matches = [
+            model
+            for model in models
+            if model.family == family
+            and (
+                model.base_model_path_or_id
+                if family == "lora"
+                else model.path_or_id
+            )
+            == LLAMA_MODEL_ID
+        ]
+        if matches:
+            boundaries[matches[-1].name] = (LLAMA_MODEL_ID, revision)
+    return boundaries
+
+
+def _disk_efficient_execution_order(
+    models: Sequence[InferenceModel],
+) -> tuple[str, ...]:
+    """Run Llama base jobs immediately after Llama LoRA jobs, then evict it."""
+    prioritized: list[InferenceModel] = []
+    for family, llama_only in (
+        ("bert", False),
+        ("lora", True),
+        ("base_llm", True),
+    ):
+        prioritized.extend(
+            model
+            for model in models
+            if model.family == family
+            and (
+                not llama_only
+                or (
+                    model.base_model_path_or_id
+                    if family == "lora"
+                    else model.path_or_id
+                )
+                == LLAMA_MODEL_ID
+            )
+        )
+    prioritized_names = {model.name for model in prioritized}
+    prioritized.extend(
+        model for model in models if model.name not in prioritized_names
+    )
+    return tuple(model.name for model in prioritized)
 
 
 def _preflight_data(
@@ -396,14 +471,17 @@ def run_rag_qwen_with_legacy_loras_colab(
     precision: str = "auto",
     device_map: str = "auto",
     max_retries: int = 0,
+    evict_llama_cache_between_families: bool = True,
     dry_run: bool = False,
 ):
     """Evaluate selected jobs using content data and Drive model artifacts.
 
-    The function expects validation CSVs and benchmark folders under
-    ``data_root`` by default. It reads legacy adapters and the portable
-    ``rag-qwen`` bundle from mounted Drive and writes resumable results back to
-    Drive. It does not mount Drive or install packages.
+    The function expects validation CSVs under ``data_root`` and benchmark
+    folders under ``drive_root/jura`` by default. It reads legacy adapters and
+    the portable ``rag-qwen`` bundle from mounted Drive and writes resumable
+    results back to Drive. By default, its exact pinned Llama cache snapshot is
+    evicted after the selected LoRA jobs and again after the base-model jobs.
+    It does not mount Drive or install packages.
     """
     project = Path(project_root).expanduser().resolve()
     data = Path(data_root).expanduser().resolve()
@@ -425,8 +503,12 @@ def run_rag_qwen_with_legacy_loras_colab(
         lora_adapters_dir or "lora_adapters", relative_to=drive
     )
     rag = _resolve_path(rag_source or "rag-qwen", relative_to=drive)
-    autotest = _resolve_path(autotest_dir or "autotest", relative_to=data)
-    documents = _resolve_path(test_docx_dir or "test_docx", relative_to=data)
+    autotest = _resolve_path(
+        autotest_dir or "jura/autotest", relative_to=drive
+    )
+    documents = _resolve_path(
+        test_docx_dir or "jura/test_docx", relative_to=drive
+    )
     output = _resolve_path(
         results_dir
         or "JURA_hypersumm_results/full_pipeline_evaluation_rag_qwen_legacy_lora",
@@ -463,6 +545,12 @@ def run_rag_qwen_with_legacy_loras_colab(
     ]
     if not selected_models:
         raise ValueError("The family/task selection produced no evaluation jobs")
+    cache_evictions = (
+        _llama_cache_evictions(selected_models)
+        if evict_llama_cache_between_families
+        else {}
+    )
+    execution_order = _disk_efficient_execution_order(selected_models)
 
     adapter_digest = hashlib.sha256(
         json.dumps(provenance, sort_keys=True).encode("utf-8")
@@ -487,6 +575,8 @@ def run_rag_qwen_with_legacy_loras_colab(
         "artifact_set_sha256": artifact_digest,
         "candidate_top_k": candidate_top_k,
         "final_top_k": final_top_k,
+        "hf_cache_evictions": cache_evictions,
+        "job_execution_order": execution_order,
         "models": [asdict(model) for model in selected_models],
         "legacy_adapters": provenance,
         "bert_models": bert_provenance,
@@ -497,15 +587,19 @@ def run_rag_qwen_with_legacy_loras_colab(
     output.mkdir(parents=True, exist_ok=True)
     provenance_path = output / "legacy_adapter_set.json"
     if provenance_path.is_file():
-        existing = json.loads(provenance_path.read_text(encoding="utf-8"))
-        if existing.get("artifact_set_sha256") != artifact_digest:
-            raise ValueError(
-                "The Drive results directory belongs to another adapter set; "
-                "choose a new results_dir."
-            )
-    provenance_path.write_text(
-        json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+        try:
+            existing = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            _backup_corrupt_json(provenance_path)
+        else:
+            if not isinstance(existing, dict):
+                _backup_corrupt_json(provenance_path)
+            elif existing.get("artifact_set_sha256") != artifact_digest:
+                raise ValueError(
+                    "The Drive results directory belongs to another adapter set; "
+                    "choose a new results_dir."
+                )
+    _atomic_write_json(provenance_path, plan)
     models_path = _write_models_input(
         selected_models, output / "colab_models_input.json"
     )
@@ -533,6 +627,8 @@ def run_rag_qwen_with_legacy_loras_colab(
             "device_map": device_map,
             "max_retries": max_retries,
         },
+        hf_cache_evictions=cache_evictions,
+        job_execution_order=execution_order,
     )
 
 
@@ -568,6 +664,11 @@ def _parse_args() -> argparse.Namespace:
         "--quantization", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--max-retries", type=int, default=0)
+    parser.add_argument(
+        "--evict-llama-cache-between-families",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -599,6 +700,9 @@ if __name__ == "__main__":
         precision=arguments.precision,
         device_map=arguments.device_map,
         max_retries=arguments.max_retries,
+        evict_llama_cache_between_families=(
+            arguments.evict_llama_cache_between_families
+        ),
         dry_run=arguments.dry_run,
     )
     if hasattr(result, "to_string"):

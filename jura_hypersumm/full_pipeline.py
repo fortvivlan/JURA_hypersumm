@@ -6,6 +6,8 @@ import gc
 import hashlib
 import json
 import traceback
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -56,6 +58,116 @@ DEFAULT_FULL_PIPELINE_PARAMETERS: dict[str, Any] = {
 
 def _safe_name(value: str) -> str:
     return "".join(character if character.isalnum() or character in "._-" else "_" for character in value)
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    """Write JSON without exposing a partially written destination file."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _backup_corrupt_file(path: Path) -> Path:
+    """Preserve a corrupt generated file before replacing it."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = path.with_name(f"{path.stem}.corrupt-{stamp}{path.suffix}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.stem}.corrupt-{stamp}-{counter}{path.suffix}"
+        )
+        counter += 1
+    path.replace(candidate)
+    return candidate
+
+
+def _load_evaluation_state(state_path: Path, fingerprint: str) -> dict[str, Any]:
+    """Load state, recovering an interrupted/empty JSON write when necessary."""
+    if not state_path.is_file():
+        return {"fingerprint": fingerprint, "jobs": {}}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not isinstance(state.get("jobs"), dict):
+            raise ValueError("state root and jobs must be JSON objects")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        backup = _backup_corrupt_file(state_path)
+        return {
+            "fingerprint": fingerprint,
+            "jobs": {},
+            "recovered_corrupt_state": backup.name,
+        }
+    if state.get("fingerprint") != fingerprint:
+        raise ValueError(
+            "Existing result state belongs to a different evaluation configuration"
+        )
+    return state
+
+
+def _read_completed_job_scores(job_dir: Path, pd):
+    """Return scores only when both persistent per-job outputs are intact."""
+    score_path = job_dir / "scores.csv"
+    workbook_path = job_dir / "results.xlsx"
+    if not score_path.is_file() or not workbook_path.is_file():
+        return None
+    try:
+        if score_path.stat().st_size == 0 or workbook_path.stat().st_size == 0:
+            return None
+        if not zipfile.is_zipfile(workbook_path):
+            return None
+        with zipfile.ZipFile(workbook_path) as workbook:
+            if workbook.testzip() is not None:
+                return None
+        scores = pd.read_csv(score_path)
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+        return None
+    return None if scores.empty else scores
+
+
+def _evict_huggingface_model_revision(model_id: str, revision: str) -> int:
+    """Delete one exact model revision from the Hugging Face cache."""
+    from huggingface_hub import scan_cache_dir
+
+    cache = scan_cache_dir()
+    commit_hashes = {
+        cached_revision.commit_hash
+        for repo in cache.repos
+        if repo.repo_type == "model" and repo.repo_id == model_id
+        for cached_revision in repo.revisions
+        if cached_revision.commit_hash == revision
+    }
+    if not commit_hashes:
+        return 0
+    strategy = cache.delete_revisions(*sorted(commit_hashes))
+    freed_bytes = int(strategy.expected_freed_size)
+    strategy.execute()
+    return freed_bytes
+
+
+def _apply_cache_eviction(
+    *,
+    entry: InferenceModel,
+    record: dict[str, Any],
+    cache_evictions: Mapping[str, tuple[str, str]],
+    state_path: Path,
+    state: dict[str, Any],
+) -> None:
+    target = cache_evictions.get(entry.name)
+    if target is None:
+        return
+    model_id, revision = target
+    marker = f"{model_id}@{revision}"
+    if record.get("cache_eviction_target") == marker:
+        return
+    freed_bytes = _evict_huggingface_model_revision(model_id, revision)
+    record.update(
+        {
+            "cache_eviction_target": marker,
+            "cache_eviction_freed_bytes": freed_bytes,
+        }
+    )
+    _atomic_write_json(state_path, state)
 
 
 def _include_source_prefix(model_family: str) -> bool:
@@ -161,11 +273,19 @@ def _load_predictor(entry: InferenceModel, prompt_text: str, parameters):
 
 def _write_job_tables(job_dir: Path, tables: dict[str, Any]) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
-    with __import__("pandas").ExcelWriter(job_dir / "results.xlsx", engine="openpyxl") as writer:
+    workbook_path = job_dir / "results.xlsx"
+    scores_path = job_dir / "scores.csv"
+    temporary_workbook = job_dir / ".results.tmp.xlsx"
+    temporary_scores = job_dir / ".scores.tmp.csv"
+    with __import__("pandas").ExcelWriter(
+        temporary_workbook, engine="openpyxl"
+    ) as writer:
         for name, table in tables.items():
             if table is not None:
                 table.to_excel(writer, sheet_name=name[:31], index=False)
-    tables["scores"].to_csv(job_dir / "scores.csv", index=False, encoding="utf-8")
+    tables["scores"].to_csv(temporary_scores, index=False, encoding="utf-8")
+    temporary_workbook.replace(workbook_path)
+    temporary_scores.replace(scores_path)
 
 
 def _evaluate_one(
@@ -305,8 +425,17 @@ def run_full_pipeline_evaluation(
     test_docx_dir: str | Path = "test_docx",
     results_dir: str | Path = "local_results/full_pipeline_evaluation",
     inference_parameters: Mapping[str, Any] | None = None,
+    hf_cache_evictions: Mapping[str, tuple[str, str]] | None = None,
+    job_execution_order: list[str] | tuple[str, ...] | None = None,
 ):
-    """Re-evaluate every selected model on validation and full DOCX benchmarks."""
+    """Re-evaluate every selected model on validation and full DOCX benchmarks.
+
+    ``hf_cache_evictions`` optionally maps a completed job name to one exact
+    ``(model_id, commit_hash)`` snapshot to remove from the Hugging Face cache.
+    It is operational only and does not change the evaluation fingerprint.
+    ``job_execution_order`` may reorder the same selected jobs for resource
+    management without changing their configuration or resume fingerprint.
+    """
     import pandas as pd
 
     overrides = dict(inference_parameters or {})
@@ -405,12 +534,20 @@ def run_full_pipeline_evaluation(
         json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     state_path = output / "state.json"
-    if state_path.is_file():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("fingerprint") != fingerprint:
-            raise ValueError("Existing result state belongs to a different evaluation configuration")
-    else:
-        state = {"fingerprint": fingerprint, "jobs": {}}
+    state = _load_evaluation_state(state_path, fingerprint)
+    cache_evictions = dict(hf_cache_evictions or {})
+    evaluation_models = models
+    if job_execution_order is not None:
+        model_by_name = {model.name: model for model in models}
+        if (
+            len(job_execution_order) != len(models)
+            or len(set(job_execution_order)) != len(job_execution_order)
+            or set(job_execution_order) != set(model_by_name)
+        ):
+            raise ValueError(
+                "job_execution_order must contain every selected job exactly once"
+            )
+        evaluation_models = [model_by_name[name] for name in job_execution_order]
     retriever = PremiseRetriever.from_components(
         bundle.codex_path,
         bundle.index_dir,
@@ -426,18 +563,41 @@ def run_full_pipeline_evaluation(
         reranker=reranker,
     )
     score_frames = []
-    for entry in models:
+    for entry in evaluation_models:
         job_dir = output / "jobs" / _safe_name(entry.name)
-        score_path = job_dir / "scores.csv"
         record = state["jobs"].setdefault(entry.name, {"status": "pending", "attempts": 0})
-        if record["status"] == "completed" and score_path.is_file():
-            score_frames.append(pd.read_csv(score_path))
+        completed_scores = _read_completed_job_scores(job_dir, pd)
+        if completed_scores is not None:
+            if record.get("status") != "completed":
+                record.update(
+                    {
+                        "status": "completed",
+                        "error": "",
+                        "recovered_from_outputs": True,
+                    }
+                )
+                _atomic_write_json(state_path, state)
+            score_frames.append(completed_scores)
+            _apply_cache_eviction(
+                entry=entry,
+                record=record,
+                cache_evictions=cache_evictions,
+                state_path=state_path,
+                state=state,
+            )
             continue
+        if record.get("status") == "completed":
+            record.update(
+                {
+                    "status": "pending",
+                    "error": "Stored per-job outputs are missing or incomplete",
+                }
+            )
         error = None
         for _ in range(int(parameters["max_retries"]) + 1):
-            record["attempts"] += 1
+            record["attempts"] = int(record.get("attempts", 0)) + 1
             record["status"] = "running"
-            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(state_path, state)
             model = tokenizer = predictor = None
             try:
                 prompt_text = prompts.binary if entry.task == "binary" else prompts.ternary
@@ -490,17 +650,30 @@ def run_full_pipeline_evaluation(
             finally:
                 model = tokenizer = predictor = None
                 _cleanup()
-                state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                _atomic_write_json(state_path, state)
         if error is not None:
             continue
+        _apply_cache_eviction(
+            entry=entry,
+            record=record,
+            cache_evictions=cache_evictions,
+            state_path=state_path,
+            state=state,
+        )
     combined = pd.concat(score_frames, ignore_index=True) if score_frames else pd.DataFrame()
-    combined.to_csv(output / "all_scores.csv", index=False, encoding="utf-8")
-    with pd.ExcelWriter(output / "all_scores.xlsx", engine="openpyxl") as writer:
+    combined_csv = output / "all_scores.csv"
+    combined_workbook = output / "all_scores.xlsx"
+    temporary_csv = output / ".all_scores.tmp.csv"
+    temporary_workbook = output / ".all_scores.tmp.xlsx"
+    combined.to_csv(temporary_csv, index=False, encoding="utf-8")
+    with pd.ExcelWriter(temporary_workbook, engine="openpyxl") as writer:
         combined.to_excel(writer, sheet_name="scores", index=False)
         pd.DataFrame([{"job": key, **value} for key, value in state["jobs"].items()]).to_excel(
             writer, sheet_name="job_status", index=False
         )
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_csv.replace(combined_csv)
+    temporary_workbook.replace(combined_workbook)
+    _atomic_write_json(state_path, state)
     failed = [name for name, value in state["jobs"].items() if value["status"] != "completed"]
     if failed:
         raise RuntimeError("Some evaluation jobs failed; rerun to resume: " + ", ".join(failed))
