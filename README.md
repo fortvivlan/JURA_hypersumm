@@ -332,8 +332,16 @@ The default scans the completed baseline campaign and uses the baseline RAG:
 uv run python run_full_pipeline_evaluation_local.py `
   --models-source local_artifacts/campaigns/full_pipeline_v1 `
   --rag-source dms-rag `
-  --prompt-set base
+  --prompt-set base `
+  --results-dir local_results/full_pipeline_evaluation_source_prefixed
 ```
+
+This evaluation applies a fixed model-family premise policy. Base LLMs and
+LoRA adapters receive `source + premise`, including the code, article, part,
+and point available in the dataset or retrieval result. BERT receives the
+unchanged premise body. The policy is included in resumable-state fingerprints
+and every score row, so use a new results directory when comparing it with an
+older body-only evaluation.
 
 The selected production candidate is packaged locally in the self-contained
 `rag-qwen/` folder: Qwen3-Embedding-0.6B, its matching FAISS index and corpus,
@@ -504,6 +512,70 @@ token is read from Colab secrets (or the `HF_TOKEN` environment variable) and
 is never printed. A token previously embedded in the legacy notebooks must be
 considered compromised and revoked.
 
+### RAG-Qwen evaluation with legacy LoRAs on Drive
+
+`run_rag_qwen_with_legacy_loras_colab.py` exposes
+`run_rag_qwen_with_legacy_loras_colab(...)`. It evaluates the existing BERT,
+base-LLM, and restored legacy-LoRA jobs without training. The module does not
+mount Drive or install packages. Install the Colab dependencies as shown above,
+select a GPU runtime, and arrange the inputs as follows:
+
+```text
+/content/full_pipeline_v1/       complete campaign (BERTs and job manifests)
+/content/val_binary.csv
+/content/val_ternary.csv
+/content/autotest/               reviewed Dialogue and Full workbooks
+/content/test_docx/              matching Dialogue and Full DOCX files
+/content/drive/MyDrive/lora_adapters/  eight legacy adapter directories
+/content/drive/MyDrive/rag-qwen/       portable RAG bundle and manifest
+```
+
+Mount Drive explicitly, inspect the resolved 18-job plan, and start the
+resumable evaluation:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+
+from run_rag_qwen_with_legacy_loras_colab import (
+    run_rag_qwen_with_legacy_loras_colab,
+)
+
+plan = run_rag_qwen_with_legacy_loras_colab(dry_run=True)
+print([model["name"] for model in plan["models"]])
+
+scores = run_rag_qwen_with_legacy_loras_colab()
+print(scores)
+```
+
+By default, outputs are written to
+`/content/drive/MyDrive/JURA_hypersumm_results/full_pipeline_evaluation_rag_qwen_legacy_lora/`.
+They include per-job `results.xlsx` and `scores.csv`, combined `all_scores.csv`
+and `all_scores.xlsx`, raw predictions, resolved model/adaptor provenance, and
+`state.json` for restart after a disconnected runtime. Reuse exactly the same
+arguments to resume.
+
+For an urgent partial run, select families and tasks and give that selection a
+separate results directory:
+
+```python
+lora_ternary_scores = run_rag_qwen_with_legacy_loras_colab(
+    families=("lora",),
+    tasks=("ternary",),
+    results_dir=(
+        "/content/drive/MyDrive/JURA_hypersumm_results/"
+        "rag_qwen_legacy_lora_ternary"
+    ),
+)
+```
+
+The main memory knobs are `document_batch_size`, `llm_batch_size`,
+`quantization`, `precision`, `device_map`, `reranker_batch_size`,
+`reranker_precision`, `embedding_device`, and `reranker_device`. Quantized
+4-bit LLM loading is enabled by default; BERT is never quantized. The selected
+RAG depth remains the fixed experiment setting of 100 candidates and 60 final
+premises.
+
 In Colab, the existing Drive folder is expected at
 `/content/drive/MyDrive/jura`. Native runs instead accept an explicit local
 artifact root. Only final trained BERT models and final LoRA adapters are
@@ -632,7 +704,9 @@ calling the same interface. `lora_local.ipynb` is the native-Windows thin
 wrapper for the saved Ministral ternary adapter.
 
 The adapter manifest must match the model ID, task, base-model revision,
-prompt, prompt-processing strategy, and current train/validation file hashes.
+prompt, prompt-processing strategy, source-prefixed premise format, and current
+train/validation file hashes. Every LoRA training and validation row is built
+from `source + premise`; the source field supplies the code/article heading.
 A missing or incompatible adapter raises an error rather than silently
 launching training. Validation, RAG retrieval, document upload, full inference,
 XLSX generation, ZIP creation, and downloads still run normally. Ministral
@@ -661,6 +735,55 @@ scores = run(
 ```
 
 Unknown hyperparameter names raise an error instead of being ignored.
+
+### Emergency replacement of full_pipeline_v1 LoRAs
+
+`run_emergency_lora_retraining_local.py` exposes
+`run_emergency_lora_retraining(...)`. It reads the hyperparameters and immutable
+base-model revision from each of the eight existing `full_pipeline_v1` LoRA
+manifests, retrains with `source + premise`, and replaces each adapter at its
+current campaign path. It intentionally skips validation and DOCX evaluation;
+run the inference-only full-pipeline evaluator afterward. BERT artifacts are
+never modified.
+
+On native Windows, install the project GPU dependencies, make the global model
+cache visible, inspect the replacement plan, and then run it:
+
+```powershell
+$env:HF_HOME = "D:\CODE\HF_MODELS"
+uv run python run_emergency_lora_retraining_local.py --dry-run
+uv run python run_emergency_lora_retraining_local.py
+
+uv run python run_full_pipeline_evaluation_local.py `
+  --models-source local_artifacts/campaigns/full_pipeline_v1 `
+  --rag-source dms-rag `
+  --prompt-set base `
+  --results-dir local_results/full_pipeline_evaluation_source_prefixed
+```
+
+The retraining runner requires the existing complete campaign adapters,
+`train_binary.csv`, `train_ternary.csv`, both validation CSVs, `dms-rag`, Git,
+PyTorch, Transformers, PEFT, Accelerate, and bitsandbytes. It writes a
+per-session JSON progress report below
+`local_results/campaigns/full_pipeline_v1/lora_retraining/` and Trainer scratch
+data below that directory's `trainer/` subfolder. `--models` and `--tasks`
+support a partial restart. The inherited campaign manifests retain the original
+quantization, precision, batch size, accumulation, sequence length,
+checkpointing, seed, and optimizer settings.
+
+The same public interface can be called in Colab after installing GPU packages,
+mounting Drive, and making the repository data and campaign directory explicit:
+
+```python
+from run_emergency_lora_retraining_local import run_emergency_lora_retraining
+
+replacement_runs = run_emergency_lora_retraining(
+    repo_root="/content/drive/MyDrive/JURA_hypersumm",
+    campaign_id="full_pipeline_v1",
+    models=("ministral",),
+    tasks=("ternary",),
+)
+```
 
 ### Staged local LoRA hyperparameter search
 
@@ -879,6 +1002,93 @@ Standalone scoring requires pandas, openpyxl, and scikit-learn and does not
 need a GPU. Full workflows retain their existing batch-size, precision,
 quantization, device, and checkpointing controls.
 
+### Offline full-pipeline prediction audit
+
+`jura_hypersumm.full_pipeline_analysis.run_full_pipeline_analysis(...)` reads
+the `document_pairs` sheet from an existing result workbook and creates an XLSX
+for error analysis without loading a model or rerunning retrieval. Each row in
+`current_comparison` contains the hypothesis, premise, saved prediction, expert
+label and comment, source, article, retrieval metadata, and an explicit error
+type. Separate worksheets collect contradiction cases, false positives, false
+negatives, confusion data, and RAG misses. When `legacy_autotest_dir` is given,
+the workbook also rescores the same saved predictions against that annotation
+snapshot and reports pair and label changes. Pass `previous_results_workbook`
+to compare the retrieved pair population and saved predictions between two
+pipeline runs. Both the current review format and
+the raw 2025 `sentence/article/premise/answer` exports are accepted.
+
+The workflow requires pandas, openpyxl, and scikit-learn plus the existing
+results XLSX, reviewed workbooks, and their matching DOCX filenames. It is CPU
+only and has no GPU or memory knobs:
+
+```python
+from jura_hypersumm.full_pipeline_analysis import run_full_pipeline_analysis
+
+audit = run_full_pipeline_analysis(
+    "local_results/full_pipeline_evaluation_baseline/jobs/"
+    "models__lora__mistralai_Ministral-8B-Instruct-2410__ternary__ternary/"
+    "results.xlsx",
+    previous_results_workbook=(
+        "local_results/campaigns/full_pipeline_v1/"
+        "lora_mistralai_Ministral-8B-Instruct-2410_ternary_RUN.xlsx"
+    ),
+    task="ternary",
+    test_dataset="Dialogue",
+    autotest_dir="autotest/Dialogue",
+    docx_dir="test_docx/Dialogue",
+    legacy_autotest_dir=".legacy",
+    output_dir="local_results/full_pipeline_analysis",
+)
+print(audit)
+```
+
+In Colab, mount Drive or upload the results XLSX, `autotest` workbooks, and
+matching `test_docx` files first, then pass their explicit paths to the same
+function. The returned path identifies the generated audit workbook.
+
+### Recovered LoRA adapter evaluation
+
+`jura_hypersumm.recovered_adapter_evaluation.run_recovered_adapter_evaluation(...)`
+loads one recovered ternary LoRA adapter and evaluates it without rerunning RAG.
+It tests the saved current `document_pairs`, the exact strings in raw legacy
+`sentence/article/premise/answer` workbooks, and optionally the current pairs
+with their separate `source` heading prepended to the premise. The resulting
+XLSX contains per-class metrics, confusion matrices, raw generations, gold
+labels, and a row-level comparison of the two current prompt formats.
+
+Install the `colab` optional dependencies for Transformers, PEFT, PyTorch, and
+4-bit bitsandbytes inference. The base model is read from `adapter_config.json`
+unless `base_model_id` is passed; Hugging Face credentials are read from
+`HF_TOKEN` when required:
+
+```python
+from jura_hypersumm.recovered_adapter_evaluation import (
+    run_recovered_adapter_evaluation,
+)
+
+report = run_recovered_adapter_evaluation(
+    adapter_dir=".legacy/mistralai_Ministral-8B-Instruct-2410(1)",
+    current_results_workbook="local_results/full_pipeline/results.xlsx",
+    current_autotest_dir="autotest/Dialogue",
+    current_docx_dir="test_docx/Dialogue",
+    legacy_autotest_dir=".legacy",
+    output_dir="local_results/recovered_adapter_evaluation",
+    batch_size=4,
+    quantization=True,
+    prompt_mode="legacy_duplicated",  # reproduce CROC_Inference.ipynb
+    compute_dtype="float16",
+)
+```
+
+In Colab, mount or upload the adapter, results workbook, expert workbooks, and
+matching DOCX files before calling the same interface. `batch_size`,
+`max_length`, `max_new_tokens`, and `quantization` are the principal GPU-memory
+controls; 4-bit quantization is the default. `prompt_mode="canonical"` uses the
+current single system prompt, while `legacy_duplicated` reproduces the old
+full-pipeline format that repeated the complete instruction inside the user
+message. Use `compute_dtype="float16"` with that mode to match the legacy
+notebook's quantized inference configuration.
+
 When at least one document is successfully analysed, the workflow also
 downloads a ZIP prepared for human review. For every document/task it contains
 `<document>_<task>_model_predictions.xlsx` with every RAG premise/model pair and
@@ -911,6 +1121,12 @@ and article lists/ranges. A cited part returns all of its points; an article-onl
 reference that maps to several corpus rows falls back to FAISS. Detected and
 unresolved citations are retained in the audit sheets. A document without
 `ПОСТАНОВИЛ` is reported and skipped.
+For generative-model classification, every exact or FAISS provision is prefixed
+with its `source` citation so the model can compare code, article, part, and
+point identifiers. BERT deliberately keeps the body-only premise.
+The body-only `premise` remains available for review/scoring, while the exact
+classifier input is saved as `model_premise`; FAISS embeddings and ranking remain
+body-only.
 Uploaded `.docx` files are isolated in a temporary directory and deleted after
 processing even if an error occurs.
 

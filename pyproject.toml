@@ -56,6 +56,7 @@ py-modules = [
     "run_rag_embedding_sweep_local",
     "run_rag_experiment_local",
     "run_full_pipeline_evaluation_local",
+    "run_rag_qwen_with_legacy_loras_colab",
 ]
 
 [tool.setuptools.packages.find]

@@ -520,6 +520,7 @@ def _run_bert(
             model_id=model_id,
             task=task,
         )
+        evaluation.predictions["model_premise"] = val_dataframe["premise"].tolist()
         announce_stage(workflow, "validation", "Validation finished.")
         announce_stage(workflow, "testing", "Loading the RAG retrieval index.")
         retriever = PremiseRetriever.from_rag_directory(
@@ -576,6 +577,7 @@ def _run_bert(
                     model_id=model_id,
                     task=task,
                     top_k=int(parameters["retrieval_top_k"]),
+                    include_source_prefix=False,
                 )
             inference_runs.append(
                 (

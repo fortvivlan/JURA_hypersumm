@@ -42,13 +42,25 @@ def build_faiss_index(
         raise ValueError("codex.csv must contain text and source columns")
     if corpus[["text", "source"]].isna().any().any():
         raise ValueError("codex.csv contains missing text or source values")
+    corpus = corpus.drop_duplicates(subset=["text", "source"], keep="first")
     documents = [
         Document(page_content=str(row.text), metadata={"source": str(row.source)})
         for row in corpus.itertuples(index=False)
     ]
-    chunks = RecursiveCharacterTextSplitter(
+    split_chunks = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     ).split_documents(documents)
+    chunks = []
+    seen_chunks: set[tuple[str, str]] = set()
+    for chunk in split_chunks:
+        key = (
+            str(chunk.page_content),
+            str(chunk.metadata.get("source", "")),
+        )
+        if key in seen_chunks:
+            continue
+        seen_chunks.add(key)
+        chunks.append(chunk)
     if embeddings is None:
         embeddings = SentenceTransformerEmbeddings(
             embedding_model,

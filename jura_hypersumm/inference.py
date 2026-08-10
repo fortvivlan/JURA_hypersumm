@@ -16,6 +16,9 @@ from .documents import (
 )
 from .retrieval import PremiseRetriever, citation_dict, citations_json
 
+BODY_ONLY_PREMISE_FORMAT = "body_only_v1"
+SOURCE_PREFIXED_PREMISE_FORMAT = "source_prefixed_v1"
+
 
 @dataclass(frozen=True)
 class ModelPrediction:
@@ -47,6 +50,24 @@ def aggregate_pair_labels(labels: Sequence[str | None], task: Task) -> str:
     return "invalid"
 
 
+def format_model_premise(premise: str, source: str) -> str:
+    """Prefix a retrieved provision with its model-visible citation source."""
+    body = premise.strip()
+    citation = source.strip()
+    if not citation or body.startswith(citation):
+        return body
+    return f"{citation} {body}".strip()
+
+
+def model_premise_format(include_source_prefix: bool) -> str:
+    """Return the stable audit label for a classifier premise policy."""
+    return (
+        SOURCE_PREFIXED_PREMISE_FORMAT
+        if include_source_prefix
+        else BODY_ONLY_PREMISE_FORMAT
+    )
+
+
 @dataclass
 class DocumentInferenceTables:
     """Aggregate, pair-level, and error tables for uploaded decisions."""
@@ -65,8 +86,9 @@ def run_document_inference(
     task: Task,
     top_k: int = 20,
     final_top_k: int | None = None,
+    include_source_prefix: bool = True,
 ) -> DocumentInferenceTables:
-    """Run operative-section sentence retrieval and classification for DOCX files."""
+    """Run retrieval and classification, optionally exposing sources to the model."""
     import pandas as pd
     from tqdm.auto import tqdm
 
@@ -123,13 +145,21 @@ def run_document_inference(
                         }
                     )
                     continue
-                predictions = predictor.predict_pairs(
-                    [record.premise for record in retrieved], hypothesis
-                )
+                model_premises = [
+                    (
+                        format_model_premise(record.premise, record.source)
+                        if include_source_prefix
+                        else record.premise
+                    )
+                    for record in retrieved
+                ]
+                predictions = predictor.predict_pairs(model_premises, hypothesis)
                 if len(predictions) != len(retrieved):
                     raise RuntimeError("Predictor returned the wrong number of results")
                 contradiction_sources: list[str] = []
-                for record, prediction in zip(retrieved, predictions):
+                for record, model_premise, prediction in zip(
+                    retrieved, model_premises, predictions
+                ):
                     if prediction.label == "contradiction":
                         contradiction_sources.append(record.source)
                     pair_rows.append(
@@ -142,6 +172,7 @@ def run_document_inference(
                             "sentence_index": sentence_index,
                             "hypothesis": hypothesis,
                             "premise": record.premise,
+                            "model_premise": model_premise,
                             "source": record.source,
                             "retrieval_method": record.method,
                             "retrieval_rank": record.rank,

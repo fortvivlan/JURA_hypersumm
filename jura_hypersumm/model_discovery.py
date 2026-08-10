@@ -24,6 +24,7 @@ class InferenceModel:
     base_model_path_or_id: str | None = None
     trust_remote_code: bool = False
     training_prompt_sha256: str | None = None
+    training_premise_format: str | None = None
 
 
 def _read_json(path: Path) -> dict:
@@ -90,6 +91,7 @@ def discover_models(directory: str | Path) -> list[InferenceModel]:
                     base_model_path_or_id=str(local_causal_ids.get(base_id, base_id)),
                     trust_remote_code=trust,
                     training_prompt_sha256=manifest.get("prompt_sha256"),
+                    training_premise_format=manifest.get("premise_format"),
                 )
             )
         elif (artifact / "config.json").is_file() and _complete_weights(
@@ -166,6 +168,7 @@ def _from_json(path: Path) -> list[InferenceModel]:
                     base_model_path_or_id=base_source,
                     trust_remote_code=bool(entry.get("trust_remote_code", False)),
                     training_prompt_sha256=entry.get("training_prompt_sha256"),
+                    training_premise_format=entry.get("training_premise_format"),
                 )
             )
     return _validate_unique(models)

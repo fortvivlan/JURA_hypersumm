@@ -37,7 +37,11 @@ from .common import (
     resolve_model,
     slugify_model_id,
 )
-from .inference import run_document_inference
+from .inference import (
+    SOURCE_PREFIXED_PREMISE_FORMAT,
+    format_model_premise,
+    run_document_inference,
+)
 from .llm_common import CausalPredictor, load_causal_model
 from .prompting import prompt_for_task
 from .reporting import (
@@ -82,8 +86,12 @@ def _validate_task(
         max_input_length=int(parameters["max_input_length"]),
         max_new_tokens=int(parameters["max_new_tokens"]),
     )
+    model_premises = [
+        format_model_premise(row.premise, row.source)
+        for row in dataframe.itertuples(index=False)
+    ]
     generated = predictor.predict_examples(
-        dataframe["premise"].tolist(),
+        model_premises,
         dataframe["hypothesis"].tolist(),
         progress_description=f"Validating ready LLM {task}",
     )
@@ -94,6 +102,7 @@ def _validate_task(
         model_id=model_id,
         task=task,  # type: ignore[arg-type]
     )
+    tables.predictions["model_premise"] = model_premises
     return tables, predictor
 
 
@@ -251,6 +260,7 @@ def run_llm_evaluation(
                         model_id=spec.model_id,
                         task=task,
                         top_k=int(parameters["retrieval_top_k"]),
+                        include_source_prefix=True,
                     )
                     document_aggregates.append(
                         add_test_dataset(tables.aggregates, dataset_name)
@@ -349,6 +359,7 @@ def run_llm_evaluation(
                 "rag_commit": rag_commit,
                 "compute_dtype": loaded.compute_dtype,
                 "summary_enabled": False,
+                "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
                 "autotest_enabled": score_autotest,
                 "multiple_test": multiple_test,
                 "test_datasets": [run[0] for run in inference_runs],

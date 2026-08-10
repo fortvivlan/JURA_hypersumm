@@ -28,6 +28,7 @@ REVIEW_COLUMNS = (
     "expert_comment",
 )
 LEGACY_REVIEW_COLUMNS = ("hypothesis", "premise", "prediction")
+RAW_LEGACY_REVIEW_COLUMNS = ("sentence", "article", "premise", "answer")
 TERNARY_TO_BINARY = {
     "contradiction": "contradiction",
     "entailment": "no",
@@ -64,9 +65,7 @@ def normalize_subject_key(path_or_name: str | Path) -> str:
     """Extract the benchmark subject key from a DOCX or review filename."""
     stem = Path(path_or_name).stem.replace("_", " ")
     words = re.findall(r"[^\s,]+", stem, flags=re.UNICODE)
-    if words and words[0].casefold() == "тест":
-        words = words[1:]
-    if words and words[0].casefold() == "ооо":
+    while words and words[0].casefold() in {"result", "тест", "ооо"}:
         words = words[1:]
     if not words:
         raise ValueError(f"Cannot determine a subject from {path_or_name!s}")
@@ -246,6 +245,15 @@ def _pair_key(hypothesis: object, premise: object, article: object) -> tuple[str
     )
 
 
+def _strip_legacy_article_prefix(premise: object, article: object) -> str:
+    """Remove the duplicated source heading used in raw 2025 review exports."""
+    premise_text = str(premise or "").strip()
+    article_text = str(article or "").strip()
+    if article_text and premise_text.casefold().startswith(article_text.casefold()):
+        return premise_text[len(article_text) :].strip()
+    return premise_text
+
+
 def _gold_for_task(label: str, task: Task) -> str:
     return label if task == "ternary" else TERNARY_TO_BINARY[label]
 
@@ -282,24 +290,43 @@ def _read_review_workbook(path: Path):
     if set(REVIEW_COLUMNS).issubset(reviewed.columns):
         reviewed.attrs["legacy_review"] = False
         return reviewed
+    if set(LEGACY_REVIEW_COLUMNS).issubset(reviewed.columns):
+        legacy = reviewed.loc[:, list(LEGACY_REVIEW_COLUMNS)].copy()
+        legacy["article_number"] = [
+            format_article_reference(premise) for premise in legacy["premise"]
+        ]
+        legacy["model_prediction"] = ""
+        legacy["expert_label"] = legacy["prediction"]
+        legacy["expert_comment"] = ""
+        result = legacy.loc[:, list(REVIEW_COLUMNS)]
+        result.attrs["legacy_review"] = True
+        return result
+    if set(RAW_LEGACY_REVIEW_COLUMNS).issubset(reviewed.columns):
+        legacy = reviewed.loc[:, list(RAW_LEGACY_REVIEW_COLUMNS)].copy()
+        legacy["hypothesis"] = legacy["sentence"]
+        legacy["premise"] = [
+            _strip_legacy_article_prefix(premise, article)
+            for premise, article in zip(legacy["premise"], legacy["article"])
+        ]
+        legacy["article_number"] = legacy["article"]
+        legacy["model_prediction"] = ""
+        legacy["expert_label"] = legacy["answer"]
+        legacy["expert_comment"] = ""
+        result = legacy.loc[:, list(REVIEW_COLUMNS)]
+        result.attrs["legacy_review"] = True
+        result.attrs["raw_legacy_review"] = True
+        return result
     missing_legacy = sorted(set(LEGACY_REVIEW_COLUMNS) - set(reviewed.columns))
-    if missing_legacy:
-        missing_current = sorted(set(REVIEW_COLUMNS) - set(reviewed.columns))
-        raise ValueError(
-            f"{path} is missing current review columns "
-            f"({', '.join(missing_current)}) and legacy columns "
-            f"({', '.join(missing_legacy)})"
-        )
-    legacy = reviewed.loc[:, list(LEGACY_REVIEW_COLUMNS)].copy()
-    legacy["article_number"] = [
-        format_article_reference(premise) for premise in legacy["premise"]
-    ]
-    legacy["model_prediction"] = ""
-    legacy["expert_label"] = legacy["prediction"]
-    legacy["expert_comment"] = ""
-    result = legacy.loc[:, list(REVIEW_COLUMNS)]
-    result.attrs["legacy_review"] = True
-    return result
+    missing_raw_legacy = sorted(
+        set(RAW_LEGACY_REVIEW_COLUMNS) - set(reviewed.columns)
+    )
+    missing_current = sorted(set(REVIEW_COLUMNS) - set(reviewed.columns))
+    raise ValueError(
+        f"{path} is missing current review columns "
+        f"({', '.join(missing_current)}) and legacy columns "
+        f"({', '.join(missing_legacy)}); it also lacks raw legacy columns "
+        f"({', '.join(missing_raw_legacy)})"
+    )
 
 
 def _evaluate(rows, *, model_id: str, task: Task, scope: str):
@@ -472,17 +499,24 @@ def score_autotest_predictions(
                 "original_gold_label": label,
                 "gold_label": _gold_for_task(label, task),
                 "excel_row": excel_row,
-                "expert_comment": _normalized_text(row["expert_comment"]),
+                "expert_comment": str(row["expert_comment"]).strip(),
+                "expert_workbook": workbook_path.name,
+                "hypothesis": str(row["hypothesis"]),
+                "premise": str(row["premise"]),
+                "article_number": str(row["article_number"]),
                 "matched": False,
             }
             gold_by_key[key] = reviewed_data
-            if not key[2]:
+            if legacy_review or not key[2]:
                 text_key = key[:2]
                 if text_key in gold_by_text_key:
-                    raise ValueError(
-                        f"Ambiguous duplicate reviewed text pair in "
-                        f"{workbook_path.name}, row {excel_row}"
-                    )
+                    previous = gold_by_text_key[text_key]
+                    if previous["original_gold_label"] != label:
+                        raise ValueError(
+                            f"Ambiguous duplicate reviewed text pair in "
+                            f"{workbook_path.name}, row {excel_row}"
+                        )
+                    continue
                 gold_by_text_key[text_key] = reviewed_data
             if _normalized_text(row["expert_comment"]) == "раг":
                 manual_rag_rows.append(
@@ -515,8 +549,20 @@ def score_autotest_predictions(
                 "subject_key": subject_key,
                 "document": document_name,
                 "hypothesis_id": getattr(row, "hypothesis_id", ""),
+                "sentence_index": getattr(row, "sentence_index", ""),
+                "hypothesis": getattr(row, "hypothesis", ""),
+                "premise": getattr(row, "premise", ""),
+                "source": getattr(row, "source", ""),
                 "article_number": article,
+                "retrieval_method": getattr(row, "retrieval_method", ""),
+                "retrieval_rank": getattr(row, "retrieval_rank", ""),
+                "retrieval_initial_rank": getattr(
+                    row, "retrieval_initial_rank", ""
+                ),
+                "retrieval_score": getattr(row, "retrieval_score", ""),
+                "reranker_score": getattr(row, "reranker_score", ""),
                 "prediction": prediction,
+                "raw_output": getattr(row, "raw_output", ""),
             }
             if reviewed_row is None:
                 original_gold = "not mentioned"
@@ -527,6 +573,8 @@ def score_autotest_predictions(
                         "original_gold_label": original_gold,
                         "gold_source": "inferred_for_new_retrieval_pair",
                         "excel_row": "",
+                        "expert_workbook": "",
+                        "expert_comment": "",
                     }
                 )
                 inferred_rows.append(dict(base))
@@ -538,6 +586,8 @@ def score_autotest_predictions(
                         "original_gold_label": reviewed_row["original_gold_label"],
                         "gold_source": "expert",
                         "excel_row": reviewed_row["excel_row"],
+                        "expert_workbook": reviewed_row["expert_workbook"],
+                        "expert_comment": reviewed_row["expert_comment"],
                     }
                 )
             model_rows.append(base)
@@ -559,12 +609,24 @@ def score_autotest_predictions(
                 "subject_key": subject_key,
                 "document": document_name,
                 "hypothesis_id": "",
-                "article_number": "",
+                "sentence_index": "",
+                "hypothesis": reviewed_row["hypothesis"],
+                "premise": reviewed_row["premise"],
+                "source": "",
+                "article_number": reviewed_row["article_number"],
+                "retrieval_method": "",
+                "retrieval_rank": "",
+                "retrieval_initial_rank": "",
+                "retrieval_score": "",
+                "reranker_score": "",
                 "prediction": "rag_miss",
+                "raw_output": "",
                 "gold_label": reviewed_row["gold_label"],
                 "original_gold_label": original_gold,
                 "gold_source": "expert",
                 "excel_row": reviewed_row["excel_row"],
+                "expert_workbook": reviewed_row["expert_workbook"],
+                "expert_comment": reviewed_row["expert_comment"],
                 "alignment_status": status,
             }
             alignment_rows.append(missing_row)

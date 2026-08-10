@@ -574,6 +574,17 @@ class PremiseRetriever:
         matches = self._vectorstore.similarity_search_with_score(
             hypothesis, k=candidate_top_k
         )
+        unique_matches = []
+        seen_documents: set[tuple[str, str]] = set()
+        for document, score in matches:
+            key = (
+                str(document.page_content),
+                str(document.metadata.get("source", "")),
+            )
+            if key in seen_documents:
+                continue
+            seen_documents.add(key)
+            unique_matches.append((document, score))
         fallback_citation = (
             detected_citations[0]
             if len(detected_citations) == 1
@@ -591,7 +602,7 @@ class PremiseRetriever:
                 unresolved_citations=detected_citations,
                 initial_rank=index,
             )
-            for index, (document, score) in enumerate(matches, start=1)
+            for index, (document, score) in enumerate(unique_matches, start=1)
         )
         if self._reranker is None:
             return RetrievalOutcome(

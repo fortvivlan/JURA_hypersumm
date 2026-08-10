@@ -21,7 +21,12 @@ def _lora(root: Path, name: str, task: str, base: str) -> None:
     _write_json(path / "adapter_config.json", {"base_model_name_or_path": base})
     _write_json(
         path / "run_config.json",
-        {"task": task, "resolved_revision": "base-rev", "prompt_sha256": "prompt"},
+        {
+            "task": task,
+            "resolved_revision": "base-rev",
+            "prompt_sha256": "prompt",
+            "premise_format": "source_prefixed_v1",
+        },
     )
     (path / "adapter_model.safetensors").write_bytes(b"adapter")
 
@@ -37,6 +42,11 @@ def test_directory_discovery_keeps_both_bert_tasks_and_infers_base(tmp_path: Pat
     assert [(model.family, model.task) for model in models].count(("bert", "binary")) == 1
     assert [(model.family, model.task) for model in models].count(("bert", "ternary")) == 1
     assert len([model for model in models if model.family == "lora"]) == 2
+    assert {
+        model.training_premise_format
+        for model in models
+        if model.family == "lora"
+    } == {"source_prefixed_v1"}
     bases = [model for model in models if model.family == "base_llm"]
     assert {model.task for model in bases} == {"binary", "ternary"}
     assert len(bases) == 2

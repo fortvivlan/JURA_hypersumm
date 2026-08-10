@@ -3,8 +3,45 @@ from pathlib import Path
 
 import pandas as pd
 
-from jura_hypersumm.full_pipeline import run_full_pipeline_evaluation
+from jura_hypersumm.full_pipeline import (
+    _include_source_prefix,
+    _load_adapter_tokenizer,
+    run_full_pipeline_evaluation,
+)
 from jura_hypersumm.rag.artifacts import RagBundle, RerankerBundle
+
+
+def test_source_prefix_policy_is_limited_to_generative_models() -> None:
+    assert not _include_source_prefix("bert")
+    assert _include_source_prefix("base_llm")
+    assert _include_source_prefix("lora")
+
+
+def test_legacy_adapter_tokenizer_falls_back_to_base(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class Tokenizer:
+        pad_token = None
+        eos_token = "</s>"
+        padding_side = "right"
+
+    fallback = Tokenizer()
+
+    def incompatible_tokenizer(*args, **kwargs):
+        raise ValueError("Tokenizer class TokenizersBackend does not exist")
+
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained", incompatible_tokenizer
+    )
+    loaded = _load_adapter_tokenizer(
+        tmp_path,
+        base_tokenizer=fallback,
+        trust_remote_code=False,
+    )
+
+    assert loaded is fallback
+    assert loaded.pad_token == "</s>"
+    assert loaded.padding_side == "left"
 
 
 def test_full_pipeline_state_resumes_completed_jobs(monkeypatch, tmp_path: Path) -> None:

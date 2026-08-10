@@ -488,6 +488,7 @@ def _adapter_matches(
     experiment: Mapping[str, Any],
     state: Mapping[str, Any],
 ) -> bool:
+    from .inference import SOURCE_PREFIXED_PREMISE_FORMAT
     from .lora import _prompt_processing_strategy
 
     target = _adapter_target(artifact_root, experiment)
@@ -513,6 +514,7 @@ def _adapter_matches(
         "prompt_processing": _prompt_processing_strategy(
             experiment["model_alias"]
         ),
+        "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
         "rag_revision": state["pins"]["rag_revision"],
         "hyperparameters": experiment["parameters"],
     }

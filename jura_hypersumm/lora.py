@@ -43,7 +43,11 @@ from .common import (
     slugify_model_id,
     validate_task,
 )
-from .inference import run_document_inference
+from .inference import (
+    SOURCE_PREFIXED_PREMISE_FORMAT,
+    format_model_premise,
+    run_document_inference,
+)
 from .llm_common import CausalPredictor, load_causal_model
 from .prompting import (
     build_ministral_training_texts,
@@ -139,8 +143,9 @@ def _tokenize_training_rows(
         total=len(dataframe),
         desc=f"Formatting {task} training data",
     ):
+        model_premise = format_model_premise(row.premise, row.source)
         prompt, full = build_texts(
-            tokenizer, row.premise, row.hypothesis, row.tag, task
+            tokenizer, model_premise, row.hypothesis, row.tag, task
         )
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         full_ids = tokenizer(full, add_special_tokens=False)["input_ids"]
@@ -443,6 +448,7 @@ def run_lora_document_inference(
             "task": validated_task,
             "prompt_sha256": prompt_sha256(prompt_for_task(validated_task)),
             "prompt_processing": _prompt_processing_strategy(spec.alias),
+            "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
         },
     )
     stored_parameters = manifest.get("hyperparameters")
@@ -509,6 +515,7 @@ def run_lora_document_inference(
                 model_id=spec.model_id,
                 task=validated_task,
                 top_k=int(parameters["retrieval_top_k"]),
+                include_source_prefix=True,
             )
             pair_tables.append(add_test_dataset(tables.pairs, dataset_name))
         document_pairs = pd.concat(pair_tables, ignore_index=True)
@@ -555,6 +562,7 @@ def run(
     results_dir: str | Path = DEFAULT_RESULTS_DIR,
     trainer_output_dir: str | Path | None = None,
     resume_from_checkpoint: str | Path | bool | None = None,
+    training_only: bool = False,
 ):
     """Train or reuse, validate, and document-test one task LoRA adapter.
 
@@ -568,6 +576,8 @@ def run(
     function returns the combined validation and autotest score table.
     ``trainer_output_dir`` optionally isolates Trainer checkpoints and logs.
     ``resume_from_checkpoint`` resumes a compatible interrupted Trainer run.
+    Set ``training_only=True`` to save the adapter and skip validation, RAG
+    loading, document inference, and result-workbook generation.
     """
     validated_task = validate_task(task)
     spec = resolve_model(model_name)
@@ -609,6 +619,7 @@ def run(
                 "validation_sha256": val_hash,
                 "prompt_sha256": current_prompt_hash,
                 "prompt_processing": prompt_processing,
+                "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
             },
         )
         stored_parameters = artifact_manifest.get("hyperparameters")
@@ -705,6 +716,7 @@ def run(
                         "validation_sha256": val_hash,
                         "prompt_sha256": current_prompt_hash,
                         "prompt_processing": prompt_processing,
+                        "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
                         "rag_requested_revision": rag_revision,
                         "rag_revision": rag_commit,
                         "reproducibility": reproducibility,
@@ -720,6 +732,13 @@ def run(
                 "training",
                 f"Fine-tuning finished; final adapter saved to {adapter_target}.",
             )
+        if training_only:
+            announce_stage(
+                workflow,
+                "complete",
+                f"Training-only workflow finished at {adapter_target}.",
+            )
+            return adapter_target
         announce_stage(
             workflow,
             "validation",
@@ -733,8 +752,12 @@ def run(
             max_input_length=int(parameters["max_input_length"]),
             max_new_tokens=int(parameters["max_new_tokens"]),
         )
+        validation_premises = [
+            format_model_premise(row.premise, row.source)
+            for row in val_dataframe.itertuples(index=False)
+        ]
         generated = predictor.predict_examples(
-            val_dataframe["premise"].tolist(),
+            validation_premises,
             val_dataframe["hypothesis"].tolist(),
             progress_description=f"Validating LoRA {validated_task}",
         )
@@ -745,6 +768,7 @@ def run(
             model_id=spec.model_id,
             task=validated_task,
         )
+        evaluation.predictions["model_premise"] = validation_premises
         announce_stage(workflow, "validation", "Validation finished.")
         announce_stage(workflow, "testing", "Loading the RAG retrieval index.")
         retriever = PremiseRetriever.from_rag_directory(
@@ -809,6 +833,7 @@ def run(
                     model_id=spec.model_id,
                     task=validated_task,
                     top_k=int(parameters["retrieval_top_k"]),
+                    include_source_prefix=True,
                 )
             inference_runs.append(
                 (
@@ -910,6 +935,7 @@ def run(
                 "validation_sha256": val_hash,
                 "prompt_sha256": current_prompt_hash,
                 "prompt_processing": prompt_processing,
+                "premise_format": SOURCE_PREFIXED_PREMISE_FORMAT,
                 "rag_requested_revision": rag_revision,
                 "rag_commit": rag_commit,
                 "compute_dtype": compute_dtype,

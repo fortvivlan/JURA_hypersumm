@@ -57,6 +57,7 @@ class OneRowDataframe:
                 SimpleNamespace(
                     premise="premise",
                     hypothesis="hypothesis",
+                    source="КоАП Статья 1",
                     tag="entailment",
                 )
             ]

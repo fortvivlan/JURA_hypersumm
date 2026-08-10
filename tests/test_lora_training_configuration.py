@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pandas as pd
+
 from jura_hypersumm import lora
 from jura_hypersumm.common import merge_parameters
 
@@ -31,6 +33,45 @@ def test_tokenized_rows_dataset_is_pickleable() -> None:
     assert len(restored) == 1
     assert restored[0]["labels"] == [1]
     assert "<locals>" not in restored.__class__.__qualname__
+
+
+def test_lora_training_text_always_includes_source_prefix(monkeypatch) -> None:
+    captured = {}
+
+    class FakeTokenizer:
+        eos_token = ""
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(character) for character in text]}
+
+    def fake_build(tokenizer, premise, hypothesis, label, task):
+        captured["premise"] = premise
+        return "prompt", "prompt label"
+
+    monkeypatch.setattr(lora, "build_training_texts", fake_build)
+    dataframe = pd.DataFrame(
+        [
+            {
+                "premise": "Provision body.",
+                "hypothesis": "Decision sentence.",
+                "source": "КоАП Статья 18.8 Часть 3.1",
+                "tag": "no",
+            }
+        ]
+    )
+
+    rows = lora._tokenize_training_rows(
+        dataframe,
+        FakeTokenizer(),
+        "binary",
+        128,
+        model_alias="qwen",
+    )
+
+    assert captured["premise"] == (
+        "КоАП Статья 18.8 Часть 3.1 Provision body."
+    )
+    assert rows[0]["labels"][-6:] == [ord(character) for character in " label"]
 
 
 def test_historical_settings_reach_lora_and_training_arguments(monkeypatch) -> None:

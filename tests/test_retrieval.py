@@ -243,6 +243,26 @@ def test_semantic_candidates_are_reranked_then_truncated_stably() -> None:
     assert reranker.calls[0][0] == "без точной ссылки"
 
 
+def test_semantic_retrieval_deduplicates_identical_index_chunks() -> None:
+    retriever, vectorstore = _retriever()
+    duplicate = FakeDocument("same premise", {"source": "same source"})
+    vectorstore.similarity_search_with_score = lambda query, k: [
+        (duplicate, 0.1),
+        (duplicate, 0.2),
+        (FakeDocument("unique premise", {"source": "unique source"}), 0.3),
+    ]
+
+    outcome = retriever.retrieve_semantic_with_details(
+        "без точной ссылки", top_k=3, final_top_k=3
+    )
+
+    assert [record.premise for record in outcome.results] == [
+        "same premise",
+        "unique premise",
+    ]
+    assert [record.rank for record in outcome.results] == [1, 2]
+
+
 def test_full_reranked_pool_retains_scores_for_dropped_candidates() -> None:
     retriever, _ = _retriever()
     candidates = retriever.retrieve_with_details(

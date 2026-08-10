@@ -3,6 +3,7 @@ from pathlib import Path
 from jura_hypersumm.inference import (
     ModelPrediction,
     aggregate_pair_labels,
+    format_model_premise,
     run_document_inference,
 )
 from jura_hypersumm.retrieval import Citation, RetrievalRecord
@@ -17,7 +18,7 @@ class FakeRetriever:
                 "p1", "source 1", "exact", 1, None, detected[0], detected
             ),
             RetrievalRecord(
-                "p2", "source 2", "exact", 2, None, detected[0], detected
+                "p2", "source 2", "faiss", 2, None, detected[0], detected
             ),
         ]
 
@@ -32,7 +33,11 @@ class TrackingRetriever(FakeRetriever):
 
 
 class FakePredictor:
+    def __init__(self) -> None:
+        self.premises = []
+
     def predict_pairs(self, premises, hypothesis):
+        self.premises = list(premises)
         return [
             ModelPrediction("no", "no"),
             ModelPrediction("contradiction", "contradiction"),
@@ -43,6 +48,16 @@ def test_aggregate_pair_labels() -> None:
     assert aggregate_pair_labels(["entailment", "contradiction"], "ternary") == "contradiction"
     assert aggregate_pair_labels([None], "binary") == "invalid"
     assert aggregate_pair_labels(["not mentioned", "entailment"], "ternary") == "entailment"
+
+
+def test_format_model_premise_adds_source_once() -> None:
+    assert format_model_premise("Provision body.", "КоАП РФ: Статья 20.20.") == (
+        "КоАП РФ: Статья 20.20. Provision body."
+    )
+    assert format_model_premise(
+        "КоАП РФ: Статья 20.20. Provision body.", "КоАП РФ: Статья 20.20."
+    ) == "КоАП РФ: Статья 20.20. Provision body."
+    assert format_model_premise(" Provision body. ", "") == "Provision body."
 
 
 def test_document_inference_preserves_contradiction_premise(
@@ -57,9 +72,10 @@ def test_document_inference_preserves_contradiction_premise(
 
     document_path = tmp_path / "decision.docx"
     document_path.write_bytes(b"stable document")
+    predictor = FakePredictor()
     tables = run_document_inference(
         [document_path],
-        predictor=FakePredictor(),
+        predictor=predictor,
         retriever=FakeRetriever(),
         model_id="bert",
         task="binary",
@@ -67,11 +83,40 @@ def test_document_inference_preserves_contradiction_premise(
 
     assert tables.aggregates.iloc[0]["prediction"] == "contradiction"
     contradiction = tables.pairs[tables.pairs["prediction"] == "contradiction"].iloc[0]
+    assert predictor.premises == ["source 1 p1", "source 2 p2"]
     assert contradiction["premise"] == "p2"
+    assert contradiction["model_premise"] == "source 2 p2"
     assert contradiction["source"] == "source 2"
+    assert contradiction["retrieval_method"] == "faiss"
     assert len(contradiction["document_sha256"]) == 64
     assert '"article": "32.9"' in contradiction["detected_citations"]
     assert tables.aggregates.iloc[0]["unresolved_citations"] == "[]"
+
+
+def test_document_inference_can_keep_bert_premises_body_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "jura_hypersumm.inference.read_docx_text", lambda path: "ПОСТАНОВИЛ: sentence"
+    )
+    monkeypatch.setattr(
+        "jura_hypersumm.inference.split_russian_sentences", lambda text: ["sentence"]
+    )
+    document_path = tmp_path / "decision.docx"
+    document_path.write_bytes(b"stable document")
+    predictor = FakePredictor()
+
+    tables = run_document_inference(
+        [document_path],
+        predictor=predictor,
+        retriever=FakeRetriever(),
+        model_id="bert",
+        task="binary",
+        include_source_prefix=False,
+    )
+
+    assert predictor.premises == ["p1", "p2"]
+    assert tables.pairs["model_premise"].tolist() == ["p1", "p2"]
 
 
 def test_document_inference_filters_irrelevant_sentences_before_retrieval(

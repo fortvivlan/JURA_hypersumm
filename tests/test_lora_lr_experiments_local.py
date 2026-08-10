@@ -157,6 +157,7 @@ def test_adapter_reuse_requires_complete_matching_manifest(tmp_path: Path) -> No
         "validation_sha256": "val-binary",
         "prompt_sha256": "prompt-binary",
         "prompt_processing": "standard_chat_template_v1",
+        "premise_format": "source_prefixed_v1",
         "rag_revision": "b" * 40,
         "hyperparameters": dict(experiment["parameters"]),
     }

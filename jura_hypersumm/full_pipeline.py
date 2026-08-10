@@ -19,7 +19,12 @@ from .common import (
     merge_parameters,
     resolve_huggingface_revision,
 )
-from .inference import run_document_inference
+from .inference import (
+    BODY_ONLY_PREMISE_FORMAT,
+    SOURCE_PREFIXED_PREMISE_FORMAT,
+    format_model_premise,
+    run_document_inference,
+)
 from .llm_common import CausalPredictor, load_causal_model
 from .model_discovery import InferenceModel, resolve_models_source, write_resolved_models
 from .prompt_sets import load_prompt_set
@@ -53,9 +58,42 @@ def _safe_name(value: str) -> str:
     return "".join(character if character.isalnum() or character in "._-" else "_" for character in value)
 
 
+def _include_source_prefix(model_family: str) -> bool:
+    """Keep BERT body-only while exposing provision headings to generative models."""
+    return model_family != "bert"
+
+
+def _load_adapter_tokenizer(
+    adapter_dir: Path,
+    *,
+    base_tokenizer,
+    trust_remote_code: bool,
+):
+    """Load an adapter tokenizer, falling back across Transformers versions.
+
+    PEFT adapters do not change vocabulary. Some legacy ``tokenizer_config``
+    files reference tokenizer classes or special-token schemas introduced by a
+    newer Transformers release. In that case, the already loaded tokenizer
+    from the adapter's pinned base model is the compatible equivalent.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            adapter_dir,
+            local_files_only=True,
+            trust_remote_code=trust_remote_code,
+        )
+    except (AttributeError, TypeError, ValueError):
+        tokenizer = base_tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+
 def _load_llm(entry: InferenceModel, parameters: Mapping[str, Any]):
     from peft import PeftModel
-    from transformers import AutoTokenizer
 
     token = get_huggingface_token()
     if entry.family == "lora":
@@ -80,14 +118,11 @@ def _load_llm(entry: InferenceModel, parameters: Mapping[str, Any]):
         precision=str(parameters["precision"]),
     )
     if entry.family == "lora":
-        tokenizer = AutoTokenizer.from_pretrained(
-            entry.path_or_id,
-            local_files_only=True,
+        tokenizer = _load_adapter_tokenizer(
+            Path(entry.path_or_id),
+            base_tokenizer=loaded.tokenizer,
             trust_remote_code=entry.trust_remote_code,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
         model = PeftModel.from_pretrained(
             loaded.model,
             entry.path_or_id,
@@ -146,8 +181,17 @@ def _evaluate_one(
     import pandas as pd
 
     validation = load_dataset(val_path, entry.task)  # type: ignore[arg-type]
+    include_source_prefix = _include_source_prefix(entry.family)
+    validation_premises = (
+        [
+            format_model_premise(row.premise, row.source)
+            for row in validation.itertuples(index=False)
+        ]
+        if include_source_prefix
+        else validation["premise"].tolist()
+    )
     predictions = predictor.predict_examples(
-        validation["premise"].tolist(),
+        validation_premises,
         validation["hypothesis"].tolist(),
         progress_description=f"Validating {entry.name}",
     )
@@ -158,6 +202,7 @@ def _evaluate_one(
         model_id=entry.name,
         task=entry.task,  # type: ignore[arg-type]
     )
+    evaluation.predictions["model_premise"] = validation_premises
     all_pairs = []
     all_aggregates = []
     all_errors = []
@@ -190,6 +235,7 @@ def _evaluate_one(
             task=entry.task,  # type: ignore[arg-type]
             top_k=int(parameters["retrieval_top_k"]),
             final_top_k=int(parameters["final_top_k"]),
+            include_source_prefix=include_source_prefix,
         )
         for table in (inference.pairs, inference.aggregates, inference.errors):
             table.insert(0, "test_dataset", dataset.name)
@@ -254,6 +300,7 @@ def run_full_pipeline_evaluation(
     reranker_revision: str | None = None,
     reranker_trust_remote_code: bool | None = None,
     repo_root: str | Path = ".",
+    validation_dir: str | Path | None = None,
     autotest_dir: str | Path = "autotest",
     test_docx_dir: str | Path = "test_docx",
     results_dir: str | Path = "local_results/full_pipeline_evaluation",
@@ -274,6 +321,11 @@ def run_full_pipeline_evaluation(
     if int(parameters["final_top_k"]) > int(parameters["candidate_top_k"]):
         raise ValueError("final_top_k cannot exceed candidate_top_k")
     root = Path(repo_root).resolve()
+    validation_root = (
+        root
+        if validation_dir is None
+        else Path(validation_dir).expanduser().resolve()
+    )
     source_path = Path(models_source)
     if not source_path.is_absolute():
         source_path = root / source_path
@@ -343,6 +395,11 @@ def run_full_pipeline_evaluation(
         "prompt_hashes": {"binary": prompts.binary_sha256, "ternary": prompts.ternary_sha256},
         "parameters": parameters,
         "reranker": reranker_config,
+        "premise_formats": {
+            "bert": BODY_ONLY_PREMISE_FORMAT,
+            "base_llm": SOURCE_PREFIXED_PREMISE_FORMAT,
+            "lora": SOURCE_PREFIXED_PREMISE_FORMAT,
+        },
     }
     fingerprint = hashlib.sha256(
         json.dumps(config, sort_keys=True, default=str).encode("utf-8")
@@ -389,7 +446,7 @@ def run_full_pipeline_evaluation(
                     entry,
                     predictor=predictor,
                     retriever=retriever,
-                    val_path=root / f"val_{entry.task}.csv",
+                    val_path=validation_root / f"val_{entry.task}.csv",
                     autotest_dir=Path(autotest_dir) if Path(autotest_dir).is_absolute() else root / autotest_dir,
                     test_docx_dir=Path(test_docx_dir) if Path(test_docx_dir).is_absolute() else root / test_docx_dir,
                     parameters=parameters,
@@ -409,6 +466,17 @@ def run_full_pipeline_evaluation(
                 scores.insert(8, "prompt_matches_training", (
                     None if entry.family != "lora" or not entry.training_prompt_sha256
                     else entry.training_prompt_sha256 == inference_hash
+                ))
+                scores.insert(9, "premise_format", (
+                    BODY_ONLY_PREMISE_FORMAT
+                    if not _include_source_prefix(entry.family)
+                    else SOURCE_PREFIXED_PREMISE_FORMAT
+                ))
+                scores.insert(10, "premise_matches_training", (
+                    None
+                    if entry.family != "lora" or not entry.training_premise_format
+                    else entry.training_premise_format
+                    == SOURCE_PREFIXED_PREMISE_FORMAT
                 ))
                 tables["scores"] = scores
                 _write_job_tables(job_dir, tables)

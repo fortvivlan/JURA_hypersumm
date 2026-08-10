@@ -253,6 +253,63 @@ def test_dialogue_legacy_sheet_and_prediction_column_are_supported(
     assert model_score["test_dataset"] == "Dialogue"
 
 
+def test_raw_legacy_export_and_result_filename_are_supported(tmp_path: Path) -> None:
+    autotest = tmp_path / "autotest"
+    documents = tmp_path / "test_docx"
+    autotest.mkdir()
+    documents.mkdir()
+    article = "КоАП РФ: Статья 20.20. п. 3. "
+    pd.DataFrame(
+        [
+            {
+                "sentence": "reviewed hypothesis",
+                "article": article,
+                "premise": article + "reviewed premise",
+                "answer": "contradiction",
+            }
+        ]
+    ).to_excel(
+        autotest / "result_Тест_Иванов_2025.xlsx", sheet_name="Sheet1", index=False
+    )
+    document = documents / "Тест_Иванов решение.docx"
+    document.write_bytes(b"test")
+    pairs = pd.DataFrame(
+        [
+            {
+                "model": "model",
+                "task": "ternary",
+                "document": document.name,
+                "hypothesis_id": "matched",
+                "sentence_index": 0,
+                "hypothesis": "reviewed hypothesis",
+                "premise": "reviewed premise",
+                "source": "КоАП РФ: Статья 20.20. ч. 3.",
+                "retrieval_method": "exact",
+                "prediction": "contradiction",
+                "raw_output": "contradiction",
+            }
+        ]
+    )
+
+    matched, _ = discover_autotest_cases(autotest, documents)
+    tables = score_autotest_predictions(
+        pairs,
+        matched,
+        model_id="model",
+        task="ternary",
+        autotest_dir=autotest,
+        docx_dir=documents,
+    )
+
+    row = tables.alignment.iloc[0]
+    assert row["gold_source"] == "expert"
+    assert row["gold_label"] == "contradiction"
+    assert row["hypothesis"] == "reviewed hypothesis"
+    assert row["premise"] == "reviewed premise"
+    assert row["raw_output"] == "contradiction"
+    assert row["expert_workbook"].startswith("result_Тест_Иванов")
+
+
 def test_binary_omits_missed_entailment_and_infers_no(tmp_path: Path) -> None:
     autotest, documents, document = _setup_benchmark(tmp_path)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,10 @@ BINARY_LABEL_BY_TERNARY_LABEL = {
     "entailment": "no",
     "not mentioned": "no",
 }
+LEGACY_SOURCE_PATTERN = re.compile(
+    r"(\S+)\s+Статья\s+(\d+\.\d+)\s+Часть\s+(\d+(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
 
 
 def _to_binary_label(label: str) -> str:
@@ -28,6 +33,32 @@ def _to_binary_label(label: str) -> str:
         raise ValueError(
             f"Unexpected label {label!r}; expected one of: {expected}"
         ) from error
+
+
+def _legacy_article_prefix(source: object) -> str:
+    """Reproduce the article heading embedded in the original training CSVs."""
+    source_text = str(source).strip()
+    if not source_text:
+        return ""
+    match = LEGACY_SOURCE_PATTERN.search(source_text)
+    if match is None:
+        return source_text
+    code, article, part = match.groups()
+    return f"ч.{part} ст.{article} {code} РФ"
+
+
+def _format_legacy_csv(dataframe: "pd.DataFrame") -> "pd.DataFrame":
+    """Embed processed source headings in premises and drop source metadata."""
+    formatted = dataframe.copy()
+    formatted["source"] = formatted["source"].fillna("")
+    formatted["premise"] = [
+        f"{prefix} {premise}" if prefix else str(premise)
+        for prefix, premise in zip(
+            formatted["source"].map(_legacy_article_prefix),
+            formatted["premise"],
+        )
+    ]
+    return formatted.loc[:, ["premise", "hypothesis", "tag"]]
 
 
 def _read_and_validate_dataset(path: Path) -> "pd.DataFrame":
@@ -71,9 +102,11 @@ def run_conversion(
 ) -> dict[str, Path]:
     """Convert train and validation XLSX files to ternary and binary CSV files.
 
-    The input row order and the ``premise``, ``hypothesis``, ``source``, and
-    ``tag`` columns are preserved. Binary outputs map ``entailment`` and
-    ``not mentioned`` to ``no``.
+    The input row order is preserved. Each ``source`` is processed with the
+    legacy article-heading rule and prepended to ``premise``; outputs contain
+    the original three columns ``premise``, ``hypothesis``, and ``tag``.
+    Binary outputs map ``entailment`` and ``not mentioned`` to ``no``. Files
+    use standard comma-separated CSV formatting.
 
     Returns a mapping from split/task names to the paths written.
     """
@@ -89,7 +122,8 @@ def run_conversion(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_paths: dict[str, Path] = {}
-    for split, ternary_dataframe in datasets.items():
+    for split, source_dataframe in datasets.items():
+        ternary_dataframe = _format_legacy_csv(source_dataframe)
         ternary_path = output_dir / f"{split}_ternary.csv"
         ternary_dataframe.to_csv(ternary_path, index=False, encoding="utf-8")
         output_paths[f"{split}_ternary"] = ternary_path
